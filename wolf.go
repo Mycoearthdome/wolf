@@ -1,37 +1,25 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	_ "image/jpeg"
+	"image/png"
 	"math"
 	"math/rand"
 	"os"
-	"strconv"
-	"strings"
-	"time"
 )
 
-type RGB struct {
-	R, G, B uint8
-}
+const MagicSignature uint32 = 0xACE1FACE
 
-func parseColor(s string) RGB {
-	parts := strings.Split(s, ",")
-	if len(parts) != 3 {
-		return RGB{0, 0, 0}
-	}
-	r, _ := strconv.Atoi(parts[0])
-	g, _ := strconv.Atoi(parts[1])
-	b, _ := strconv.Atoi(parts[2])
-	return RGB{uint8(r), uint8(g), uint8(b)}
-}
+type RGB struct{ R, G, B uint8 }
 
-func (c RGB) String() string {
-	return fmt.Sprintf("%d,%d,%d", c.R, c.G, c.B)
-}
-
-// --- NKS k=3 Totalistic Engine ---
+// --- CORE NKS & CRYPTO ---
 
 func getRuleCode(ruleNum int) [7]uint8 {
 	var code [7]uint8
@@ -42,186 +30,245 @@ func getRuleCode(ruleNum int) [7]uint8 {
 	return code
 }
 
-func applyTotalisticRule(l, m, r uint8, ruleCode [7]uint8) uint8 {
-	return ruleCode[l+m+r]
+func generateDynamicRule(baseRule int, rowSum int, passwordHash []byte) int {
+	mix := int(binary.BigEndian.Uint64(passwordHash[:8]))
+	return (baseRule ^ (rowSum * 31) ^ mix) % 2187
 }
 
-// --- Steganography Core ---
-
-func encode(path string, pre, post, ruleNum, width int, palette [3]RGB) {
-	rawData, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Println("Error reading file:", err)
-		return
+func xorProcess(data []byte, password string) []byte {
+	hash := sha256.Sum256([]byte(password))
+	seed := int64(binary.BigEndian.Uint64(hash[:8]))
+	rng := rand.New(rand.NewSource(seed))
+	result := make([]byte, len(data))
+	for i := range data {
+		result[i] = data[i] ^ uint8(rng.Intn(256))
 	}
+	return result
+}
 
-	fileSize := uint32(len(rawData))
-	payload := make([]byte, 4+fileSize)
-	binary.BigEndian.PutUint32(payload[:4], fileSize)
-	copy(payload[4:], rawData)
+// --- LAYER 1: INTERNAL NKS VAULT ---
 
-	ruleCode := getRuleCode(ruleNum)
-	totalBits := len(payload) * 8
-	pixelsNeeded := int(math.Ceil(float64(totalBits) / 3.0))
+func createInnerVault(rawData []byte, ruleNum int, password string) []byte {
+	passHash := sha256.Sum256([]byte(password))
+	payload := make([]byte, 8+len(rawData))
+	binary.BigEndian.PutUint32(payload[0:4], MagicSignature)
+	binary.BigEndian.PutUint32(payload[4:8], uint32(len(rawData)))
+	copy(payload[8:], rawData)
 
-	dataRows := int(math.Ceil(float64(pixelsNeeded) / float64(width)))
+	encrypted := xorProcess(payload, password)
+	width := 1024
+	pre, post := 64, 64
+	dataRows := int(math.Ceil(float64(len(encrypted)*8) / float64(width*2)))
 	height := pre + dataRows + post
-	rowSize := (width*3 + 3) &^ 3
-	fileSizeTotal := 54 + (rowSize * height)
+	rowSize := (width + 3) &^ 3
+	bmp := make([]byte, 54+(256*4)+(rowSize*height))
 
-	grid := make([][]uint8, height)
-	for i := range grid {
-		grid[i] = make([]uint8, width)
-	}
-	grid[0][width/2] = 2 // Central Seed
-
-	for y := 1; y < height; y++ {
-		for x := 0; x < width; x++ {
-			l := grid[y-1][(x-1+width)%width]
-			m := grid[y-1][x]
-			r := grid[y-1][(x+1)%width]
-			grid[y][x] = applyTotalisticRule(l, m, r, ruleCode)
-		}
-	}
-
-	bmp := make([]byte, fileSizeTotal)
 	copy(bmp[0:2], "BM")
-	binary.LittleEndian.PutUint32(bmp[2:6], uint32(fileSizeTotal))
-	binary.LittleEndian.PutUint32(bmp[10:14], 54)
-	binary.LittleEndian.PutUint32(bmp[14:18], 40)
+	binary.LittleEndian.PutUint32(bmp[2:6], uint32(len(bmp)))
+	binary.LittleEndian.PutUint32(bmp[10:14], 54+(256*4))
 	binary.LittleEndian.PutUint32(bmp[18:22], uint32(width))
 	binary.LittleEndian.PutUint32(bmp[22:26], uint32(height))
 	binary.LittleEndian.PutUint16(bmp[26:28], 1)
-	binary.LittleEndian.PutUint16(bmp[28:30], 24)
+	binary.LittleEndian.PutUint16(bmp[28:30], 8)
 
+	pRng := rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(passHash[:8]))))
+	for i := 0; i < 256; i++ {
+		idx := 54 + i*4
+		bmp[idx], bmp[idx+1], bmp[idx+2] = uint8(pRng.Intn(256)), uint8(pRng.Intn(256)), uint8(pRng.Intn(256))
+	}
+
+	grid := make([]uint8, width)
+	grid[width/2] = 2
 	pByte, pBit := 0, 0
-	for y := 0; y < height; y++ {
-		rowStart := 54 + (height-1-y)*rowSize
-		for x := 0; x < width; x++ {
-			color := palette[grid[y][x]]
-			channels := []uint8{color.B, color.G, color.R}
+	masterRng := rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(passHash[8:16]))))
 
-			if y >= pre && pByte < len(payload) {
-				for i := 0; i < 3 && pByte < len(payload); i++ {
-					bit := (payload[pByte] >> pBit) & 1
-					channels[i] = (channels[i] & 0xFE) | bit
-					pBit++
+	for y := 0; y < height; y++ {
+		rowSum := 0
+		for _, v := range grid {
+			rowSum += int(v)
+		}
+		ruleCode := getRuleCode(generateDynamicRule(ruleNum, rowSum, passHash[:]))
+		rowSalt := masterRng.Int63()
+		rowRng := rand.New(rand.NewSource(rowSalt))
+
+		rowStart := 54 + (256 * 4) + (height-1-y)*rowSize
+		nextGrid := make([]uint8, width)
+		for x := 0; x < width; x++ {
+			state := grid[x]
+			pixelVal := uint8(rowRng.Intn(256))
+			if y >= pre && pByte < len(encrypted) {
+				bitShift := (int(state) + int(rowSalt) + x) % 3 * 2
+				pixelVal = (pixelVal & ^(0x03 << bitShift)) | (((encrypted[pByte] >> pBit) & 0x03) << bitShift)
+				pBit += 2
+				if pBit == 8 {
+					pBit, pByte = 0, pByte+1
+				}
+			}
+			bmp[rowStart+x] = pixelVal
+			l, r := grid[(x-1+width)%width], grid[(x+1)%width]
+			nextGrid[x] = ruleCode[l+state+r]
+		}
+		grid = nextGrid
+	}
+	return bmp
+}
+
+// --- LAYER 2: CARRIER LSB ---
+
+func doubleEncode(file, carrier, pass string, rule int) {
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Println("File error:", err)
+		return
+	}
+	vault := createInnerVault(raw, rule, pass)
+
+	var cImg image.Image
+	if carrier != "" {
+		f, _ := os.Open(carrier)
+		cImg, _, _ = image.Decode(f)
+		f.Close()
+	} else {
+		cImg = image.NewRGBA(image.Rect(0, 0, 2048, 2048))
+	}
+
+	b := cImg.Bounds()
+	stego := image.NewRGBA(b)
+	draw.Draw(stego, b, cImg, b.Min, draw.Src)
+
+	outPay := make([]byte, 4+len(vault))
+	binary.BigEndian.PutUint32(outPay[:4], uint32(len(vault)))
+	copy(outPay[4:], vault)
+
+	pIdx, pBit := 0, 0
+	for y := 0; y < b.Dy() && pIdx < len(outPay); y++ {
+		for x := 0; x < b.Dx() && pIdx < len(outPay); x++ {
+			px := stego.RGBAAt(x, y)
+			chans := []*uint8{&px.R, &px.G, &px.B}
+			for _, val := range chans {
+				if pIdx < len(outPay) {
+					*val = (*val & 0xFC) | ((outPay[pIdx] >> pBit) & 0x03)
+					pBit += 2
 					if pBit == 8 {
-						pBit = 0
-						pByte++
+						pBit, pIdx = 0, pIdx+1
 					}
 				}
 			}
-			bmp[rowStart+x*3], bmp[rowStart+x*3+1], bmp[rowStart+x*3+2] = channels[0], channels[1], channels[2]
+			stego.SetRGBA(x, y, px)
 		}
 	}
-
-	outputName := "nks_stego.bmp"
-	os.WriteFile(outputName, bmp, 0644)
-
-	// --- CRITICAL OUTPUT FOR THE USER ---
-	fmt.Println("\n==========================================================")
-	fmt.Println("    NKS STEGANOGRAPHY ENCODING COMPLETE")
-	fmt.Println("==========================================================")
-	fmt.Printf("Output File: %s\n", outputName)
-	fmt.Printf("Dimensions:  %d x %d\n", width, height)
-	fmt.Printf("Rule Used:   %d\n", ruleNum)
-	fmt.Printf("Palette:     c0:%s | c1:%s | c2:%s\n", palette[0], palette[1], palette[2])
-	fmt.Println("----------------------------------------------------------")
-	fmt.Println("To decode this file later, use the following command:")
-	fmt.Printf("./wolf -m decode -f %s -rule %d -pre %d -c0 %s -c1 %s -c2 %s\n",
-		outputName, ruleNum, pre, palette[0], palette[1], palette[2])
-	fmt.Println("==========================================================\n")
+	f, _ := os.Create("final_stego.png")
+	png.Encode(f, stego)
+	fmt.Println("Double-Hardened Stego created: final_stego.png")
 }
 
-func decode(path string, pre, ruleNum int, palette [3]RGB) {
-	data, err := os.ReadFile(path)
+func doubleDecode(stegoFile, pass string, rule int) {
+	fIn, err := os.Open(stegoFile)
 	if err != nil {
-		fmt.Println("Error reading BMP:", err)
+		fmt.Println("Error:", err)
+		return
+	}
+	img, err := png.Decode(fIn)
+	fIn.Close()
+	if err != nil {
+		fmt.Println("Error:", err)
 		return
 	}
 
-	width := int(binary.LittleEndian.Uint32(data[18:22]))
-	height := int(binary.LittleEndian.Uint32(data[22:26]))
-	rowSize := (width*3 + 3) &^ 3
-	ruleCode := getRuleCode(ruleNum)
+	b := img.Bounds()
+	var rawVault []byte
+	var curB uint8
+	bCount, vSize, found := 0, uint32(0), false
 
-	grid := make([][]uint8, height)
-	for i := range grid {
-		grid[i] = make([]uint8, width)
-	}
-	grid[0][width/2] = 2
-	for y := 1; y < height; y++ {
-		for x := 0; x < width; x++ {
-			l := grid[y-1][(x-1+width)%width]
-			m := grid[y-1][x]
-			r := grid[y-1][(x+1)%width]
-			grid[y][x] = applyTotalisticRule(l, m, r, ruleCode)
-		}
-	}
-
-	var payload []byte
-	var currentByte uint8
-	bitCount, foundSize := 0, false
-	var fileSize uint32
-
-	for y := pre; y < height; y++ {
-		rowStart := 54 + (height-1-y)*rowSize
-		for x := 0; x < width; x++ {
-			for c := 0; c < 3; c++ {
-				bit := data[rowStart+x*3+c] & 1
-				currentByte |= (bit << bitCount)
-				bitCount++
-				if bitCount == 8 {
-					payload = append(payload, currentByte)
-					currentByte, bitCount = 0, 0
-					if !foundSize && len(payload) == 4 {
-						fileSize = binary.BigEndian.Uint32(payload)
-						foundSize = true
+	for y := 0; y < b.Dy(); y++ {
+		for x := 0; x < b.Dx(); x++ {
+			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			for _, val := range []uint8{c.R, c.G, c.B} {
+				curB |= (val & 0x03) << bCount
+				bCount += 2
+				if bCount == 8 {
+					rawVault = append(rawVault, curB)
+					curB, bCount = 0, 0
+					if !found && len(rawVault) == 4 {
+						vSize = binary.BigEndian.Uint32(rawVault)
+						found = true
 					}
-					if foundSize && len(payload) == int(fileSize)+4 {
-						os.WriteFile("extracted_data.bin", payload[4:], 0644)
-						fmt.Println("Success: Data extracted to 'extracted_data.bin'")
-						return
+					if found && uint32(len(rawVault)) == vSize+4 {
+						goto InnerVault
 					}
 				}
 			}
 		}
+	}
+
+InnerVault:
+	iv := rawVault[4:]
+	w := int(binary.LittleEndian.Uint32(iv[18:22]))
+	h := int(binary.LittleEndian.Uint32(iv[22:26]))
+	off := int(binary.LittleEndian.Uint32(iv[10:14]))
+	rowSize := (w + 3) &^ 3
+
+	passHash := sha256.Sum256([]byte(pass))
+	grid := make([]uint8, w)
+	grid[w/2] = 2
+	masterRng := rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(passHash[8:16]))))
+
+	var extracted []byte
+	var tmpB uint8
+	tmpBit := 0
+
+	for y := 0; y < h; y++ {
+		rowSum := 0
+		for _, v := range grid {
+			rowSum += int(v)
+		}
+		ruleCode := getRuleCode(generateDynamicRule(rule, rowSum, passHash[:]))
+		rowSalt := masterRng.Int63()
+		rowStart := off + (h-1-y)*rowSize
+
+		nextGrid := make([]uint8, w)
+		for x := 0; x < w; x++ {
+			state := grid[x]
+			if y >= 64 && rowStart+x < len(iv) {
+				shift := (int(state) + int(rowSalt) + x) % 3 * 2
+				bits := (iv[rowStart+x] >> shift) & 0x03
+				tmpB |= (bits << tmpBit)
+				tmpBit += 2
+				if tmpBit == 8 {
+					extracted = append(extracted, tmpB)
+					tmpB, tmpBit = 0, 0
+				}
+			}
+			l, r := grid[(x-1+w)%w], grid[(x+1)%w]
+			nextGrid[x] = ruleCode[l+state+r]
+		}
+		grid = nextGrid
+	}
+
+	final := xorProcess(extracted, pass)
+	if len(final) >= 8 && binary.BigEndian.Uint32(final[:4]) == MagicSignature {
+		size := binary.BigEndian.Uint32(final[4:8])
+		if int(size)+8 > len(final) {
+			fmt.Println("ACCESS DENIED: Logic Desync Detected.")
+			return
+		}
+		os.WriteFile("recovered.bin", final[8:8+size], 0644)
+		fmt.Println("UNLOCKED: written recovered.bin successfully.")
+	} else {
+		fmt.Println("ACCESS DENIED: Wrong password or rule.")
 	}
 }
 
 func main() {
-	mode := flag.String("m", "encode", "Mode")
-	file := flag.String("f", "", "File path")
-	rule := flag.Int("rule", 912, "Rule")
-	pre := flag.Int("pre", 100, "Pre-rows")
-	post := flag.Int("post", 100, "Post-rows")
-	width := flag.Int("width", 1024, "Width")
-	randPal := flag.Bool("rand", false, "Randomize colors")
-	c0 := flag.String("c0", "25,25,55", "Color 0")
-	c1 := flag.String("c1", "50,150,200", "Color 1")
-	c2 := flag.String("c2", "220,100,40", "Color 2")
+	m := flag.String("m", "encode", "")
+	f := flag.String("f", "", "")
+	c := flag.String("carrier", "", "")
+	r := flag.Int("rule", 912, "")
+	p := flag.String("pass", "wolfram", "")
 	flag.Parse()
-
-	palette := [3]RGB{parseColor(*c0), parseColor(*c1), parseColor(*c2)}
-
-	if *randPal && *mode == "encode" {
-		rand.Seed(time.Now().UnixNano())
-		palette = [3]RGB{
-			{uint8(rand.Intn(256)), uint8(rand.Intn(256)), uint8(rand.Intn(256))},
-			{uint8(rand.Intn(256)), uint8(rand.Intn(256)), uint8(rand.Intn(256))},
-			{uint8(rand.Intn(256)), uint8(rand.Intn(256)), uint8(rand.Intn(256))},
-		}
-	}
-
-	if *file == "" {
-		fmt.Println("Error: File flag (-f) is required.")
-		return
-	}
-
-	if *mode == "encode" {
-		encode(*file, *pre, *post, *rule, *width, palette)
+	if *m == "encode" {
+		doubleEncode(*f, *c, *p, *r)
 	} else {
-		decode(*file, *pre, *rule, palette)
+		doubleDecode(*f, *p, *r)
 	}
 }
