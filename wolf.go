@@ -7,10 +7,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"image"
-	"image/draw"
-	_ "image/jpeg"
-	"image/png"
 	"io"
 	"math"
 	"math/rand"
@@ -19,17 +15,17 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/songgao/water"
 )
 
 const (
-	MagicSignature uint32 = 0xACE1FACE
-	ChunkSize             = 1200
-	TUN_MTU               = 400
-	VaultWidth            = 256
-	VaultHeight           = 128
+	MagicSignature  uint32 = 0xACE1FACE
+	ChunkSize              = 1400 // Optimized for standard MTU
+	TUN_MTU                = 600  // Higher MTU possible with LSB4
+	VaultWidth             = 256
+	VaultHeight            = 128
+	BMP_HEADER_SIZE        = 1078
 )
 
 var (
@@ -95,7 +91,7 @@ func (f *FragMan) Add(sID, tot, idx uint32, d []byte) []byte {
 	return nil
 }
 
-// --- Optimized Stego Logic ---
+// --- Turbo Stego Logic ---
 
 func getKeys(basePass string, baseRule int, seq uint32) (int, string) {
 	cacheMu.RLock()
@@ -142,171 +138,67 @@ func createVault(raw []byte, r int, p string) []byte {
 	zw.Close()
 
 	payload := append(binary.BigEndian.AppendUint32(nil, MagicSignature), b.Bytes()...)
-	enc := xor(payload, p)
-
-	rowS := (VaultWidth + 3) &^ 3
-	bmp := make([]byte, 54+1024+(rowS*VaultHeight))
-	copy(bmp[0:2], "BM")
-	binary.LittleEndian.PutUint32(bmp[18:22], uint32(VaultWidth))
-	binary.LittleEndian.PutUint32(bmp[22:26], uint32(VaultHeight))
-	binary.LittleEndian.PutUint16(bmp[28:30], 8)
-
-	grid := make([]uint8, VaultWidth)
-	grid[VaultWidth/2] = 2
-	h := sha256.Sum256([]byte(p))
-	mRng := rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(h[8:16]))))
-
-	for y := 0; y < VaultHeight; y++ {
-		rSum := 0
-		for _, v := range grid {
-			rSum += int(v)
-		}
-		rCode := [27]uint8{}
-		n := (r ^ (rSum * 31)) % 2187
-		if n < 0 {
-			n = -n
-		}
-		for i := 0; i < 27; i++ {
-			rCode[i] = uint8(n % 3)
-			n /= 3
-		}
-
-		salt := mRng.Int63()
-		rRng := rand.New(rand.NewSource(salt))
-		off := 1078 + (VaultHeight-1-y)*rowS
-		next := make([]uint8, VaultWidth)
-
-		for x := 0; x < VaultWidth; x++ {
-			if y >= 16 && y < 112 {
-				byteIdx := (y-16)*64 + (x / 4)
-				if byteIdx < len(enc) {
-					sh := (int(grid[x]%3) + int(salt) + x) % 3 * 2
-					bmp[off+x] = (uint8(rRng.Intn(256)) & ^(0x03 << sh)) | (((enc[byteIdx] >> (uint(x%4) * 2)) & 0x03) << sh)
-				} else {
-					bmp[off+x] = uint8(rRng.Intn(256))
-				}
-			} else {
-				bmp[off+x] = uint8(rRng.Intn(256))
-			}
-			l, rv := grid[(x-1+VaultWidth)%VaultWidth]%3, grid[(x+1)%VaultWidth]%3
-			next[x] = rCode[int(l)*9+int(grid[x]%3)*3+int(rv)]
-		}
-		grid = next
-	}
-	return bmp
+	return xor(payload, p)
 }
 
 func encode(msg []byte, r int, p string, seq uint32) []byte {
 	vault := createVault(msg, r, p)
-	img := image.NewNRGBA(image.Rect(0, 0, 256, 256))
-	rand.New(rand.NewSource(int64(seq))).Read(img.Pix)
+	const imgDataSize = 256 * 256
+	const totalSize = BMP_HEADER_SIZE + imgDataSize
+	bmp := make([]byte, totalSize)
 
-	header := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, uint32(len(vault))), seq)
-	data := append(header, vault...)
+	// Static BMP Header (Grayscale 8-bit)
+	copy(bmp[0:2], "BM")
+	binary.LittleEndian.PutUint32(bmp[2:6], uint32(totalSize))
+	binary.LittleEndian.PutUint32(bmp[10:14], BMP_HEADER_SIZE)
+	binary.LittleEndian.PutUint32(bmp[14:18], 40)
+	binary.LittleEndian.PutUint32(bmp[18:22], 256)
+	binary.LittleEndian.PutUint32(bmp[22:26], 256)
+	binary.LittleEndian.PutUint16(bmp[26:28], 1)
+	binary.LittleEndian.PutUint16(bmp[28:30], 8)
 
-	dIdx, bShift := 0, uint(0)
-	for i := 0; i < len(img.Pix) && dIdx < len(data); i++ {
-		if (i+1)%4 == 0 {
-			continue
-		}
-		img.Pix[i] = (img.Pix[i] & 0xFC) | ((data[dIdx] >> bShift) & 0x03)
-		bShift += 2
-		if bShift == 8 {
-			bShift, dIdx = 0, dIdx+1
-		}
+	for i := 0; i < 256; i++ {
+		off := 54 + (i * 4)
+		bmp[off], bmp[off+1], bmp[off+2] = uint8(i), uint8(i), uint8(i)
 	}
-	buf := new(bytes.Buffer)
-	png.Encode(buf, img)
-	return buf.Bytes()
+
+	rand.New(rand.NewSource(int64(seq))).Read(bmp[BMP_HEADER_SIZE:])
+
+	// LSB4 Header Injection (VaultLen + Seq)
+	hdr := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, uint32(len(vault))), seq)
+	for i := 0; i < 16; i++ {
+		bmp[BMP_HEADER_SIZE+i] = (bmp[BMP_HEADER_SIZE+i] & 0xF0) | ((hdr[i/2] >> (uint(i%2) * 4)) & 0x0F)
+	}
+
+	// LSB4 Vault Injection
+	for i := 0; i < len(vault)*2; i++ {
+		bmp[BMP_HEADER_SIZE+16+i] = (bmp[BMP_HEADER_SIZE+16+i] & 0xF0) | ((vault[i/2] >> (uint(i%2) * 4)) & 0x0F)
+	}
+	return bmp
 }
 
 func decode(stego []byte, r int, p string) ([]byte, uint32, bool) {
-	img, err := png.Decode(bytes.NewReader(stego))
-	if err != nil {
+	if len(stego) < BMP_HEADER_SIZE+16 {
 		return nil, 0, false
 	}
-	b := img.Bounds()
-	nrgba := image.NewNRGBA(b)
-	draw.Draw(nrgba, b, img, b.Min, draw.Src)
 
 	var hdr [8]byte
-	idx, bit := 0, uint(0)
-	for i := 0; i < len(nrgba.Pix) && idx < 8; i++ {
-		if (i+1)%4 == 0 {
-			continue
-		}
-		hdr[idx] |= (nrgba.Pix[i] & 0x03) << bit
-		bit += 2
-		if bit == 8 {
-			bit, idx = 0, idx+1
-		}
+	for i := 0; i < 16; i++ {
+		hdr[i/2] |= (stego[BMP_HEADER_SIZE+i] & 0x0F) << (uint(i%2) * 4)
 	}
-	vS := binary.BigEndian.Uint32(hdr[:4])
+	vLen := binary.BigEndian.Uint32(hdr[:4])
 	seq := binary.BigEndian.Uint32(hdr[4:8])
-	if vS > 1000000 || vS < 1078 {
+
+	if vLen > 30000 || vLen == 0 {
 		return nil, 0, false
 	}
 
-	vault := make([]byte, vS)
-	vIdx, vBit, skipped := 0, uint(0), 0
-	for i := 0; i < len(nrgba.Pix) && vIdx < int(vS); i++ {
-		if (i+1)%4 == 0 {
-			continue
-		}
-		if skipped < 32 {
-			skipped++
-			continue
-		}
-		vault[vIdx] |= (nrgba.Pix[i] & 0x03) << vBit
-		vBit += 2
-		if vBit == 8 {
-			vBit, vIdx = 0, vIdx+1
-		}
+	vault := make([]byte, vLen)
+	for i := 0; i < int(vLen)*2; i++ {
+		vault[i/2] |= (stego[BMP_HEADER_SIZE+16+i] & 0x0F) << (uint(i%2) * 4)
 	}
 
-	rowS := (VaultWidth + 3) &^ 3
-	grid := make([]uint8, VaultWidth)
-	grid[VaultWidth/2] = 2
-	h := sha256.Sum256([]byte(p))
-	mRng := rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(h[8:16]))))
-
-	var encData []byte
-	var tB uint8
-	var tBit uint = 0
-	for y := 0; y < VaultHeight; y++ {
-		rSum := 0
-		for _, v := range grid {
-			rSum += int(v)
-		}
-		rCode := [27]uint8{}
-		n := (r ^ (rSum * 31)) % 2187
-		if n < 0 {
-			n = -n
-		}
-		for i := 0; i < 27; i++ {
-			rCode[i] = uint8(n % 3)
-			n /= 3
-		}
-		salt := mRng.Int63()
-		off := 1078 + (VaultHeight-1-y)*rowS
-		next := make([]uint8, VaultWidth)
-		for x := 0; x < VaultWidth; x++ {
-			if y >= 16 && y < 112 {
-				sh := (int(grid[x]%3) + int(salt) + x) % 3 * 2
-				tB |= ((vault[off+x] >> sh) & 0x03) << tBit
-				tBit += 2
-				if tBit == 8 {
-					encData = append(encData, tB)
-					tB, tBit = 0, 0
-				}
-			}
-			l, rv := grid[(x-1+VaultWidth)%VaultWidth]%3, grid[(x+1)%VaultWidth]%3
-			next[x] = rCode[int(l)*9+int(grid[x]%3)*3+int(rv)]
-		}
-		grid = next
-	}
-
-	f := xor(encData, p)
+	f := xor(vault, p)
 	if len(f) > 4 && binary.BigEndian.Uint32(f[:4]) == MagicSignature {
 		zr, err := gzip.NewReader(bytes.NewReader(f[4:]))
 		if err == nil {
@@ -318,12 +210,9 @@ func decode(stego []byte, r int, p string) ([]byte, uint32, bool) {
 	return nil, 0, false
 }
 
-// --- Networking & Management ---
+// --- Networking ---
 
 func configureInterface(name, localIP string) {
-	if runtime.GOOS != "linux" {
-		return
-	}
 	_ = exec.Command("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU)).Run()
 	_ = exec.Command("ip", "addr", "add", localIP+"/24", "dev", name).Run()
 }
@@ -332,13 +221,16 @@ func worker() {
 	for job := range encryptChan {
 		r, p := getKeys(state.BasePass, state.BaseRule, job.seq)
 		stego := encode(job.payload, r, p, job.seq)
-		sID, tot := rand.Uint32(), uint32(math.Ceil(float64(len(stego))/float64(ChunkSize)))
+		sID := rand.Uint32()
+		tot := uint32(math.Ceil(float64(len(stego)) / float64(ChunkSize)))
+
 		tMu.RLock()
 		target := tAddr
 		tMu.RUnlock()
 		if target == nil {
 			continue
 		}
+
 		for i := uint32(0); i < tot; i++ {
 			h := make([]byte, 13)
 			h[0] = 4
@@ -371,27 +263,13 @@ func main() {
 
 	tunDevice, _ = water.New(water.Config{DeviceType: water.TUN})
 	configureInterface(tunDevice.Name(), *tunIP)
-	fmt.Printf("\033[32m[+] Ultra-Fast StegoVPN: %s (Cores: %d)\033[0m\n", *tunIP, runtime.NumCPU())
+	fmt.Printf("\033[35m[!] TURBO StegoVPN (BMP-LSB4) Online: %s\033[0m\n", *tunIP)
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go worker()
 	}
 
-	go func() {
-		for {
-			time.Sleep(3 * time.Second)
-			tMu.RLock()
-			target := tAddr
-			tMu.RUnlock()
-			if target != nil {
-				h := make([]byte, 13)
-				h[0] = 1
-				binary.BigEndian.PutUint32(h[1:5], atomic.LoadUint32(&state.Seq))
-				conn.WriteToUDP(h, target)
-			}
-		}
-	}()
-
+	// Receiver Loop
 	go func() {
 		numCores := runtime.NumCPU()
 		for {
@@ -415,12 +293,13 @@ func main() {
 				continue
 			}
 			sID, tot, idx := binary.BigEndian.Uint32(buf[1:5]), binary.BigEndian.Uint32(buf[5:9]), binary.BigEndian.Uint32(buf[9:13])
+
 			if full := frags.Add(sID, tot, idx, buf[13:n]); full != nil {
-				go func(imgData []byte) {
+				go func(img []byte) {
 					curr := atomic.LoadUint32(&state.Seq)
 					// Fast Path
 					r0, p0 := getKeys(state.BasePass, state.BaseRule, curr)
-					if dec, seq, ok := decode(imgData, r0, p0); ok {
+					if dec, seq, ok := decode(img, r0, p0); ok {
 						atomic.StoreUint32(&state.Seq, seq+1)
 						tunDevice.Write(dec)
 						return
@@ -435,14 +314,14 @@ func main() {
 							continue
 						}
 						wg.Add(1)
-						go func(offset int) {
+						go func(o int) {
 							defer wg.Done()
 							if atomic.LoadInt32(&found) == 1 {
 								return
 							}
-							sSeq := uint32(int(curr) + offset)
+							sSeq := uint32(int(curr) + o)
 							r, p := getKeys(state.BasePass, state.BaseRule, sSeq)
-							if dec, seq, ok := decode(imgData, r, p); ok {
+							if dec, seq, ok := decode(img, r, p); ok {
 								if atomic.CompareAndSwapInt32(&found, 0, 1) {
 									if seq >= curr {
 										atomic.StoreUint32(&state.Seq, seq+1)
@@ -461,6 +340,7 @@ func main() {
 		}
 	}()
 
+	// Read from TUN
 	for {
 		pkt := make([]byte, TUN_MTU)
 		n, err := tunDevice.Read(pkt)
