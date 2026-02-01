@@ -11,33 +11,39 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/songgao/water"
 )
 
 const (
 	MagicSignature  uint32 = 0xACE1FACE
-	ChunkSize              = 1400 // Optimized for standard MTU
-	TUN_MTU                = 600  // Higher MTU possible with LSB4
-	VaultWidth             = 256
-	VaultHeight            = 128
+	TUN_MTU                = 1400
 	BMP_HEADER_SIZE        = 1078
 )
 
 var (
-	state       *SessionState
-	conn        *net.UDPConn
-	tAddr       *net.UDPAddr
-	tMu         sync.RWMutex
-	frags       = &FragMan{Sess: make(map[uint32]*FileSess)}
-	encryptChan = make(chan encryptJob, 512)
-	tunDevice   *water.Interface
-	keyCache    = make(map[uint32]cachedKey)
-	cacheMu     sync.RWMutex
+	state          *SessionState
+	conn           *net.UDPConn
+	tAddr          *net.UDPAddr
+	tMu            sync.RWMutex
+	encryptChan    = make(chan encryptJob, 4096)
+	tunDevice      *water.Interface
+	keyCache       = make(map[uint32]string)
+	cacheMu        sync.RWMutex
+	origForwarding string
+	origFragHigh   string
+	origFragLow    string
+	origFragTime   string
+	lastSeen       int64 // Atomic timestamp
 )
 
 type encryptJob struct {
@@ -45,80 +51,29 @@ type encryptJob struct {
 	seq     uint32
 }
 
-type cachedKey struct {
-	rule int
-	pass string
-}
-
 type SessionState struct {
-	BaseRule int
 	BasePass string
 	Seq      uint32
 }
 
-type FileSess struct {
-	mu       sync.Mutex
-	Data     [][]byte
-	Received int
-	Total    int
-}
+// --- Stego & Crypto Logic ---
 
-type FragMan struct {
-	mu   sync.Mutex
-	Sess map[uint32]*FileSess
-}
-
-func (f *FragMan) Add(sID, tot, idx uint32, d []byte) []byte {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	fs, ok := f.Sess[sID]
-	if !ok {
-		fs = &FileSess{Data: make([][]byte, tot), Total: int(tot)}
-		f.Sess[sID] = fs
-	}
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	if idx >= uint32(len(fs.Data)) || fs.Data[idx] != nil {
-		return nil
-	}
-	fs.Data[idx] = d
-	fs.Received++
-	if fs.Received == fs.Total {
-		res := bytes.Join(fs.Data, nil)
-		delete(f.Sess, sID)
-		return res
-	}
-	return nil
-}
-
-// --- Turbo Stego Logic ---
-
-func getKeys(basePass string, baseRule int, seq uint32) (int, string) {
+func getKeys(basePass string, seq uint32) string {
 	cacheMu.RLock()
 	if val, ok := keyCache[seq]; ok {
 		cacheMu.RUnlock()
-		return val.rule, val.pass
+		return val
 	}
 	cacheMu.RUnlock()
-
 	h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", basePass, seq)))
-	r := (baseRule + int(seq)) % 2187
-	if r < 0 {
-		r = -r
-	}
 	pass := fmt.Sprintf("%x", h)
-
 	cacheMu.Lock()
-	if len(keyCache) > 1000 {
-		for k := range keyCache {
-			if k < seq-500 {
-				delete(keyCache, k)
-			}
-		}
+	keyCache[seq] = pass
+	if len(keyCache) > 5000 {
+		keyCache = make(map[uint32]string)
 	}
-	keyCache[seq] = cachedKey{rule: r, pass: pass}
 	cacheMu.Unlock()
-	return r, pass
+	return pass
 }
 
 func xor(d []byte, p string) []byte {
@@ -131,223 +86,263 @@ func xor(d []byte, p string) []byte {
 	return res
 }
 
-func createVault(raw []byte, r int, p string) []byte {
+func encode(msg []byte, p string, seq uint32) []byte {
 	var b bytes.Buffer
 	zw := gzip.NewWriter(&b)
-	zw.Write(raw)
+	zw.Write(msg)
 	zw.Close()
-
 	payload := append(binary.BigEndian.AppendUint32(nil, MagicSignature), b.Bytes()...)
-	return xor(payload, p)
-}
-
-func encode(msg []byte, r int, p string, seq uint32) []byte {
-	vault := createVault(msg, r, p)
-	const imgDataSize = 256 * 256
-	const totalSize = BMP_HEADER_SIZE + imgDataSize
-	bmp := make([]byte, totalSize)
-
-	// Static BMP Header (Grayscale 8-bit)
-	copy(bmp[0:2], "BM")
-	binary.LittleEndian.PutUint32(bmp[2:6], uint32(totalSize))
-	binary.LittleEndian.PutUint32(bmp[10:14], BMP_HEADER_SIZE)
-	binary.LittleEndian.PutUint32(bmp[14:18], 40)
-	binary.LittleEndian.PutUint32(bmp[18:22], 256)
-	binary.LittleEndian.PutUint32(bmp[22:26], 256)
-	binary.LittleEndian.PutUint16(bmp[26:28], 1)
-	binary.LittleEndian.PutUint16(bmp[28:30], 8)
-
-	for i := 0; i < 256; i++ {
-		off := 54 + (i * 4)
-		bmp[off], bmp[off+1], bmp[off+2] = uint8(i), uint8(i), uint8(i)
+	vault := xor(payload, p)
+	dataLen := len(vault)
+	pixelCount := 16 + (dataLen * 2)
+	side := int(math.Ceil(math.Sqrt(float64(pixelCount))))
+	if side < 1 {
+		side = 1
 	}
-
-	rand.New(rand.NewSource(int64(seq))).Read(bmp[BMP_HEADER_SIZE:])
-
-	// LSB4 Header Injection (VaultLen + Seq)
-	hdr := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, uint32(len(vault))), seq)
+	bmp := make([]byte, BMP_HEADER_SIZE+(side*side))
+	copy(bmp[0:2], "BM")
+	binary.LittleEndian.PutUint32(bmp[10:14], BMP_HEADER_SIZE)
+	hdr := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, uint32(dataLen)), seq)
 	for i := 0; i < 16; i++ {
 		bmp[BMP_HEADER_SIZE+i] = (bmp[BMP_HEADER_SIZE+i] & 0xF0) | ((hdr[i/2] >> (uint(i%2) * 4)) & 0x0F)
 	}
-
-	// LSB4 Vault Injection
-	for i := 0; i < len(vault)*2; i++ {
+	for i := 0; i < dataLen*2; i++ {
 		bmp[BMP_HEADER_SIZE+16+i] = (bmp[BMP_HEADER_SIZE+16+i] & 0xF0) | ((vault[i/2] >> (uint(i%2) * 4)) & 0x0F)
 	}
 	return bmp
 }
 
-func decode(stego []byte, r int, p string) ([]byte, uint32, bool) {
+func decode(stego []byte, p string) ([]byte, uint32, bool) {
 	if len(stego) < BMP_HEADER_SIZE+16 {
 		return nil, 0, false
 	}
-
 	var hdr [8]byte
 	for i := 0; i < 16; i++ {
 		hdr[i/2] |= (stego[BMP_HEADER_SIZE+i] & 0x0F) << (uint(i%2) * 4)
 	}
-	vLen := binary.BigEndian.Uint32(hdr[:4])
-	seq := binary.BigEndian.Uint32(hdr[4:8])
-
-	if vLen > 30000 || vLen == 0 {
+	vLen, seq := binary.BigEndian.Uint32(hdr[:4]), binary.BigEndian.Uint32(hdr[4:8])
+	if vLen == 0 || vLen > 65000 {
 		return nil, 0, false
 	}
-
 	vault := make([]byte, vLen)
 	for i := 0; i < int(vLen)*2; i++ {
-		vault[i/2] |= (stego[BMP_HEADER_SIZE+16+i] & 0x0F) << (uint(i%2) * 4)
+		off := BMP_HEADER_SIZE + 16 + i
+		if off >= len(stego) {
+			break
+		}
+		vault[i/2] |= (stego[off] & 0x0F) << (uint(i%2) * 4)
 	}
-
 	f := xor(vault, p)
 	if len(f) > 4 && binary.BigEndian.Uint32(f[:4]) == MagicSignature {
-		zr, err := gzip.NewReader(bytes.NewReader(f[4:]))
-		if err == nil {
+		zr, _ := gzip.NewReader(bytes.NewReader(f[4:]))
+		if zr != nil {
 			dec, _ := io.ReadAll(zr)
-			zr.Close()
 			return dec, seq, true
 		}
 	}
 	return nil, 0, false
 }
 
-// --- Networking ---
+// --- Resilience Logic ---
 
-func configureInterface(name, localIP string) {
-	_ = exec.Command("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU)).Run()
-	_ = exec.Command("ip", "addr", "add", localIP+"/24", "dev", name).Run()
+func sendControlPacket(op byte, target *net.UDPAddr, secret string, seq uint32) {
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprintf("%s-%d-%d", secret, op, seq)))
+	sig := h.Sum(nil)
+	pkt := append([]byte{op}, binary.BigEndian.AppendUint32(nil, seq)...)
+	pkt = append(pkt, sig...)
+	conn.WriteToUDP(pkt, target)
 }
 
-func worker() {
-	for job := range encryptChan {
-		r, p := getKeys(state.BasePass, state.BaseRule, job.seq)
-		stego := encode(job.payload, r, p, job.seq)
-		sID := rand.Uint32()
-		tot := uint32(math.Ceil(float64(len(stego)) / float64(ChunkSize)))
+func verifyControl(pkt []byte, secret string) (byte, uint32, bool) {
+	if len(pkt) < 37 {
+		return 0, 0, false
+	}
+	op := pkt[0]
+	seq := binary.BigEndian.Uint32(pkt[1:5])
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprintf("%s-%d-%d", secret, op, seq)))
+	return op, seq, bytes.Equal(pkt[5:37], h.Sum(nil))
+}
 
-		tMu.RLock()
-		target := tAddr
-		tMu.RUnlock()
-		if target == nil {
-			continue
+// --- System ---
+
+func configureSystem(name, localIP, peerIP string, isServer bool) (string, string) {
+	run := func(c string, args ...string) { _ = exec.Command(c, args...).Run() }
+	getSys := func(k string) string {
+		out, _ := exec.Command("sysctl", "-n", k).Output()
+		return strings.TrimSpace(string(out))
+	}
+	origForwarding = getSys("net.ipv4.ip_forward")
+	origFragHigh = getSys("net.ipv4.ipfrag_high_thresh")
+	origFragLow = getSys("net.ipv4.ipfrag_low_thresh")
+	origFragTime = getSys("net.ipv4.ipfrag_time")
+	out, _ := exec.Command("ip", "route", "show", "default").Output()
+	fields := strings.Fields(string(out))
+	var gw, dev string
+	for i, f := range fields {
+		if f == "via" {
+			gw = fields[i+1]
 		}
-
-		for i := uint32(0); i < tot; i++ {
-			h := make([]byte, 13)
-			h[0] = 4
-			binary.BigEndian.PutUint32(h[1:5], sID)
-			binary.BigEndian.PutUint32(h[5:9], tot)
-			binary.BigEndian.PutUint32(h[9:13], i)
-			start, end := i*ChunkSize, (i+1)*ChunkSize
-			if end > uint32(len(stego)) {
-				end = uint32(len(stego))
-			}
-			conn.WriteToUDP(append(h, stego[start:end]...), target)
+		if f == "dev" {
+			dev = fields[i+1]
 		}
 	}
+	run("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU))
+	run("ip", "addr", "add", localIP+"/24", "dev", name)
+	run("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
+	run("sysctl", "-w", "net.ipv4.ipfrag_high_thresh=134217728")
+	run("sysctl", "-w", "net.ipv4.ipfrag_low_thresh=100663296")
+	run("sysctl", "-w", "net.ipv4.ipfrag_time=60")
+	if !isServer {
+		run("ip", "route", "add", peerIP, "via", gw, "dev", dev)
+		run("ip", "route", "add", "0.0.0.0/1", "dev", name)
+		run("ip", "route", "add", "128.0.0.0/1", "dev", name)
+	} else {
+		run("sysctl", "-w", "net.ipv4.ip_forward=1")
+		run("iptables", "-P", "FORWARD", "ACCEPT")
+		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE")
+	}
+	return gw, dev
+}
+
+func cleanup(name, peerIP, gw, dev string, isServer bool) {
+	run := func(c string, args ...string) { _ = exec.Command(c, args...).Run() }
+	fmt.Println("\n[*] Restoring system...")
+	run("sysctl", "-w", "net.ipv4.ip_forward="+origForwarding)
+	run("sysctl", "-w", "net.ipv4.ipfrag_high_thresh="+origFragHigh)
+	run("sysctl", "-w", "net.ipv4.ipfrag_low_thresh="+origFragLow)
+	run("sysctl", "-w", "net.ipv4.ipfrag_time="+origFragTime)
+	run("iptables", "-t", "mangle", "-F")
+	if isServer {
+		run("iptables", "-t", "nat", "-F")
+	} else {
+		run("ip", "route", "del", peerIP)
+	}
+	os.Exit(0)
 }
 
 func main() {
 	lPort := flag.String("l", "9000", "Listen Port")
 	tAddrStr := flag.String("t", "", "Peer IP:Port")
-	pass := flag.String("p", "shibboleth", "Passphrase")
-	rule := flag.Int("r", 912, "Wolfram Seed")
+	pass := flag.String("p", "shibboleth", "Secret Key")
 	tunIP := flag.String("ip", "10.0.0.1", "Local TUN IP")
+	isServer := flag.Bool("server", false, "Server Mode")
 	flag.Parse()
 
-	state = &SessionState{BaseRule: *rule, BasePass: *pass}
+	state = &SessionState{BasePass: *pass}
 	lAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:"+*lPort)
 	conn, _ = net.ListenUDP("udp", lAddr)
+	_ = conn.SetReadBuffer(64 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(64 * 1024 * 1024)
+
 	if *tAddrStr != "" {
 		tAddr, _ = net.ResolveUDPAddr("udp", *tAddrStr)
 	}
-
 	tunDevice, _ = water.New(water.Config{DeviceType: water.TUN})
-	configureInterface(tunDevice.Name(), *tunIP)
-	fmt.Printf("\033[35m[!] TURBO StegoVPN (BMP-LSB4) Online: %s\033[0m\n", *tunIP)
-
-	for i := 0; i < runtime.NumCPU(); i++ {
-		go worker()
+	pHost := ""
+	if *tAddrStr != "" {
+		pHost, _, _ = net.SplitHostPort(*tAddrStr)
 	}
+	gw, dev := configureSystem(tunDevice.Name(), *tunIP, pHost, *isServer)
 
-	// Receiver Loop
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() { <-sig; cleanup(tunDevice.Name(), pHost, gw, dev, *isServer) }()
+
+	// KeepAlive & Dead-Man Switch
 	go func() {
-		numCores := runtime.NumCPU()
+		atomic.StoreInt64(&lastSeen, time.Now().Unix())
 		for {
-			buf := make([]byte, 2048)
-			n, remote, err := conn.ReadFromUDP(buf)
-			if err != nil || n < 1 {
+			tMu.RLock()
+			target := tAddr
+			tMu.RUnlock()
+			if target != nil {
+				curr := atomic.LoadUint32(&state.Seq)
+
+				// Dead-Man Switch Logic
+				ls := atomic.LoadInt64(&lastSeen)
+				if time.Now().Unix()-ls > 30 {
+					fmt.Println("[!] Connection Stalled. Triggering Resync...")
+					sendControlPacket(1, target, state.BasePass, curr) // Force Sync
+					atomic.StoreInt64(&lastSeen, time.Now().Unix())
+				} else {
+					sendControlPacket(2, target, state.BasePass, curr) // Heartbeat
+				}
+			}
+			time.Sleep(10 * time.Second)
+		}
+	}()
+
+	// Receiver
+	go func() {
+		for {
+			buf := make([]byte, 65535)
+			n, rem, err := conn.ReadFromUDP(buf)
+			if err != nil {
 				continue
 			}
 			tMu.Lock()
-			tAddr = remote
+			tAddr = rem
 			tMu.Unlock()
+			atomic.StoreInt64(&lastSeen, time.Now().Unix())
 
-			if buf[0] == 1 {
-				newSeq := binary.BigEndian.Uint32(buf[1:5])
-				if newSeq > atomic.LoadUint32(&state.Seq) {
-					atomic.StoreUint32(&state.Seq, newSeq)
-				}
-				continue
-			}
-			if n < 13 {
-				continue
-			}
-			sID, tot, idx := binary.BigEndian.Uint32(buf[1:5]), binary.BigEndian.Uint32(buf[5:9]), binary.BigEndian.Uint32(buf[9:13])
-
-			if full := frags.Add(sID, tot, idx, buf[13:n]); full != nil {
-				go func(img []byte) {
+			op := buf[0]
+			if op == 1 || op == 2 {
+				if _, nS, ok := verifyControl(buf[:n], state.BasePass); ok {
 					curr := atomic.LoadUint32(&state.Seq)
-					// Fast Path
-					r0, p0 := getKeys(state.BasePass, state.BaseRule, curr)
-					if dec, seq, ok := decode(img, r0, p0); ok {
-						atomic.StoreUint32(&state.Seq, seq+1)
-						tunDevice.Write(dec)
-						return
-					}
-					// Parallel Search
-					resultChan := make(chan []byte, 1)
-					var wg sync.WaitGroup
-					found := int32(0)
-					half := numCores / 2
-					for i := -half; i <= half; i++ {
-						if i == 0 {
-							continue
+					if nS > curr || op == 1 {
+						atomic.StoreUint32(&state.Seq, nS)
+						if op == 1 {
+							fmt.Printf("[!] PEER RECOVERED. Seq set to: %d\n", nS)
 						}
-						wg.Add(1)
-						go func(o int) {
-							defer wg.Done()
-							if atomic.LoadInt32(&found) == 1 {
-								return
-							}
-							sSeq := uint32(int(curr) + o)
-							r, p := getKeys(state.BasePass, state.BaseRule, sSeq)
-							if dec, seq, ok := decode(img, r, p); ok {
-								if atomic.CompareAndSwapInt32(&found, 0, 1) {
-									if seq >= curr {
-										atomic.StoreUint32(&state.Seq, seq+1)
-									}
-									resultChan <- dec
-								}
-							}
-						}(i)
 					}
-					go func() { wg.Wait(); close(resultChan) }()
-					if res, ok := <-resultChan; ok {
-						tunDevice.Write(res)
+				}
+			} else if op == 4 {
+				go func(stego []byte) {
+					curr := atomic.LoadUint32(&state.Seq)
+					for o := -20; o <= 20; o++ {
+						p := getKeys(state.BasePass, uint32(int(curr)+o))
+						if dec, s, ok := decode(stego, p); ok {
+							if s >= curr {
+								atomic.StoreUint32(&state.Seq, s+1)
+							}
+							tunDevice.Write(dec)
+							return
+						}
 					}
-				}(full)
+				}(buf[1:n])
 			}
 		}
 	}()
 
-	// Read from TUN
+	// Worker Pool
+	for i := 0; i < runtime.NumCPU(); i++ {
+		go func() {
+			for job := range encryptChan {
+				p := getKeys(state.BasePass, job.seq)
+				stego := encode(job.payload, p, job.seq)
+				tMu.RLock()
+				target := tAddr
+				tMu.RUnlock()
+				if target != nil {
+					conn.WriteToUDP(append([]byte{4}, stego...), target)
+				}
+			}
+		}()
+	}
+
+	fmt.Println("[!] Turbo-Stego VPN Operational.")
+	pkt := make([]byte, TUN_MTU)
 	for {
-		pkt := make([]byte, TUN_MTU)
 		n, err := tunDevice.Read(pkt)
 		if err != nil {
 			break
 		}
 		s := atomic.AddUint32(&state.Seq, 1) - 1
-		encryptChan <- encryptJob{payload: append([]byte(nil), pkt[:n]...), seq: s}
+		select {
+		case encryptChan <- encryptJob{payload: append([]byte(nil), pkt[:n]...), seq: s}:
+		default:
+		}
 	}
 }
