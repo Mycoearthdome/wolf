@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -21,82 +22,45 @@ import (
 )
 
 const (
-	MagicSignature  uint32 = 0xACE1FACE
-	TUN_MTU                = 1426
-	BMP_HEADER_SIZE        = 54
-	OP_DATA         byte   = 4
-	OP_AUTH         byte   = 5
-	OP_HEARTBEAT    byte   = 6
-	SESSION_TIMEOUT        = 300
+	MagicSignature uint32 = 0xACE1FACE
+	// TUN_MTU 1000 + 6-bit expansion + UDP/IP headers fits perfectly under 1500
+	TUN_MTU              = 1000
+	BMP_HEADER_SIZE      = 54
+	OP_DATA         byte = 4
+	OP_AUTH         byte = 5
+	OP_HEARTBEAT    byte = 6
 )
 
-// --- Helper: Generate HWID ---
-func getHWID() string {
-	host, _ := os.Hostname()
-	// Quick hash of hostname for identity
-	h := sha256.Sum256([]byte(host))
-	return fmt.Sprintf("%x", h[:8])
-}
-
-// --- Sliding Window Logic ---
-type ReplayWindow struct {
-	mu     sync.Mutex
-	maxSeq uint32
-	mask   uint64
-}
-
-func (rw *ReplayWindow) Verify(seq uint32) bool {
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
-	if seq > rw.maxSeq {
-		shift := seq - rw.maxSeq
-		if shift >= 64 {
-			rw.mask = 1
-		} else {
-			rw.mask = (rw.mask << shift) | 1
-		}
-		rw.maxSeq = seq
-		return true
+var (
+	mgr            = &SessionManager{}
+	conn           *net.UDPConn
+	outboundChan   = make(chan outboundJob, 1000) // Smaller channel to prevent bufferbloat
+	origForwarding string
+	myAssignedIP   string
+	basePass       string
+	clientSeq      uint32
+	serverSeq      uint32
+	sessionCount   int64
+	bufferPool     = sync.Pool{
+		New: func() interface{} { return make([]byte, 65535) },
 	}
-	diff := rw.maxSeq - seq
-	if diff >= 64 || (rw.mask>>diff&1) != 0 {
-		return false
-	}
-	rw.mask |= (1 << diff)
-	return true
-}
+)
 
-// --- Session Logic ---
 type UserSession struct {
 	Addr       *net.UDPAddr
 	HWID       string
 	InternalIP string
-	Window     *ReplayWindow
+	SeqIn      uint32
 	SeqOut     uint32
 	LastSeen   int64
 	UserKey    []byte
 }
 
 type SessionManager struct {
-	mu      sync.RWMutex
-	ByIP    map[string]*UserSession
-	ByAddr  map[string]*UserSession
-	ByHWID  map[string]*UserSession
-	UsedIPs map[string]bool
+	ByIP   sync.Map
+	ByAddr sync.Map
+	ByHWID sync.Map
 }
-
-var (
-	mgr            = &SessionManager{ByIP: make(map[string]*UserSession), ByAddr: make(map[string]*UserSession), ByHWID: make(map[string]*UserSession), UsedIPs: make(map[string]bool)}
-	conn           *net.UDPConn
-	outboundChan   = make(chan outboundJob, 20000)
-	inboundChan    = make(chan inboundJob, 20000)
-	tunDevice      *water.Interface
-	origForwarding string
-	myAssignedIP   string
-	basePass       string
-	clientSeq      uint32
-	clientWindow   = &ReplayWindow{}
-)
 
 type outboundJob struct {
 	payload []byte
@@ -105,98 +69,116 @@ type outboundJob struct {
 	key     []byte
 }
 
-type inboundJob struct {
-	data []byte
-	from *net.UDPAddr
+// --- High Performance 6-Bit Wolfram-ChaCha ---
+
+func wolframChaCha(data []byte, key []byte, seq uint32) []byte {
+	h := sha256.Sum256(binary.BigEndian.AppendUint32(key, seq))
+	c, _ := chacha20.NewUnauthenticatedCipher(h[:32], h[20:32])
+
+	seed := int64(binary.BigEndian.Uint64(h[:8]))
+	rng := rand.New(rand.NewSource(seed))
+
+	out := make([]byte, len(data))
+	for i := range data {
+		out[i] = data[i] ^ uint8(rng.Intn(256))
+	}
+	c.XORKeyStream(out, out)
+	return out
 }
 
-// --- Stego & Crypto Core ---
-func deriveUserBaseKey(master, ip string) []byte {
-	h := sha256.Sum256([]byte(master + ip))
-	return h[:]
-}
+func encode6Bit(msg []byte, key []byte, seq uint32) []byte {
+	payload := append(binary.BigEndian.AppendUint32(nil, MagicSignature), msg...)
+	encrypted := wolframChaCha(payload, key, seq)
 
-func fastCrypt(data []byte, key []byte, seq uint32) {
-	var nonce [chacha20.NonceSize]byte
-	binary.LittleEndian.PutUint32(nonce[0:4], seq)
-	c, _ := chacha20.NewUnauthenticatedCipher(key, nonce[:])
-	c.XORKeyStream(data, data)
-}
+	vLen := uint32(len(encrypted))
+	meta := make([]byte, 8)
+	binary.BigEndian.PutUint32(meta[0:4], vLen)
+	binary.BigEndian.PutUint32(meta[4:8], seq)
 
-func encode(msg []byte, key []byte, seq uint32) []byte {
-	// 1. Encapsulate and Encrypt
-	vault := make([]byte, 4+len(msg))
-	binary.BigEndian.PutUint32(vault[0:4], MagicSignature)
-	copy(vault[4:], msg)
-	fastCrypt(vault, key, seq)
+	full := append(meta, encrypted...)
 
-	dataLen := len(vault)
-	// Metadata (16) + Vault (dataLen) - No doubling!
-	payloadArea := 16 + dataLen
-	bmp := make([]byte, BMP_HEADER_SIZE+payloadArea)
+	// Packing: 6 bits per byte.
+	bmpBodyLen := (len(full)*8 + 5) / 6
+	bmp := bufferPool.Get().([]byte)[:BMP_HEADER_SIZE+bmpBodyLen]
 
-	// 2. BMP Header
+	// BMP Header construction
 	copy(bmp[0:2], "BM")
 	binary.LittleEndian.PutUint32(bmp[2:6], uint32(len(bmp)))
 	binary.LittleEndian.PutUint32(bmp[10:14], uint32(BMP_HEADER_SIZE))
 	binary.LittleEndian.PutUint32(bmp[14:18], 40)
-	binary.LittleEndian.PutUint32(bmp[18:22], uint32(payloadArea/3))
+	binary.LittleEndian.PutUint32(bmp[18:22], uint32(bmpBodyLen/3))
 	binary.LittleEndian.PutUint32(bmp[22:26], 1)
 	binary.LittleEndian.PutUint16(bmp[26:28], 1)
 	binary.LittleEndian.PutUint16(bmp[28:30], 24)
 
-	// 3. Pack Metadata (8 bits per byte)
-	hdr := make([]byte, 8)
-	binary.BigEndian.PutUint32(hdr[0:4], uint32(dataLen))
-	binary.BigEndian.PutUint32(hdr[4:8], seq)
+	// Bit Packing Logic
+	bitCursor := 0
+	for _, b := range full {
+		for i := 7; i >= 0; i-- {
+			bit := (b >> i) & 1
+			byteIdx := BMP_HEADER_SIZE + (bitCursor / 6)
+			bitPos := 5 - (bitCursor % 6)
 
-	// We use 2 bytes of BMP per 1 byte of header to keep metadata slightly
-	// more robust/spread out, or we can go full 1:1. Let's do 1:1 for max speed.
-	for i := 0; i < 8; i++ {
-		bmp[BMP_HEADER_SIZE+i] = hdr[i]
+			if bitCursor%6 == 0 {
+				bmp[byteIdx] = 0x40 // Base intensity to keep pixels "gray-ish"
+			}
+			bmp[byteIdx] |= (bit << bitPos)
+			bitCursor++
+		}
 	}
-
-	// 4. Inject Vault Data (1:1 Packing)
-	copy(bmp[BMP_HEADER_SIZE+16:], vault)
-
 	return bmp
 }
 
-func decode(stego []byte, key []byte, window *ReplayWindow) ([]byte, bool) {
-	if len(stego) < BMP_HEADER_SIZE+16 {
+func decode6Bit(stego []byte, key []byte, seqPtr *uint32) ([]byte, bool) {
+	if len(stego) < BMP_HEADER_SIZE+12 {
 		return nil, false
 	}
 
-	// 1. Extract Metadata
-	vLen := binary.BigEndian.Uint32(stego[BMP_HEADER_SIZE : BMP_HEADER_SIZE+4])
-	seq := binary.BigEndian.Uint32(stego[BMP_HEADER_SIZE+4 : BMP_HEADER_SIZE+8])
-
-	// 2. Sliding window check
-	if vLen == 0 || vLen > 2000 || !window.Verify(seq) {
-		return nil, false
+	// Bit Unpacking
+	totalBits := (len(stego) - BMP_HEADER_SIZE) * 6
+	bitStream := make([]byte, (totalBits/8)+1)
+	for i := 0; i < totalBits; i++ {
+		byteIdx := BMP_HEADER_SIZE + (i / 6)
+		bitPos := 5 - (i % 6)
+		if byteIdx >= len(stego) {
+			break
+		}
+		bit := (stego[byteIdx] >> bitPos) & 1
+		bitStream[i/8] |= (bit << (7 - (i % 8)))
 	}
 
-	if int(BMP_HEADER_SIZE+16+vLen) > len(stego) {
+	if len(bitStream) < 8 {
 		return nil, false
 	}
+	vLen := binary.BigEndian.Uint32(bitStream[0:4])
+	rSeq := binary.BigEndian.Uint32(bitStream[4:8])
 
-	// 3. Extract Vault
-	vault := make([]byte, vLen)
-	copy(vault, stego[BMP_HEADER_SIZE+16:BMP_HEADER_SIZE+16+vLen])
+	if vLen == 0 || int(8+vLen) > len(bitStream) {
+		return nil, false
+	}
+	vault := bitStream[8 : 8+vLen]
 
-	// 4. Decrypt and Verify
-	fastCrypt(vault, key, seq)
-	if binary.BigEndian.Uint32(vault[0:4]) == MagicSignature {
-		return vault[4:], true
+	curr := atomic.LoadUint32(seqPtr)
+	for o := -15; o <= 15; o++ { // Slightly tighter window for speed
+		sSeq := uint32(int(rSeq) + o)
+		dec := wolframChaCha(vault, key, sSeq)
+		if len(dec) > 4 && binary.BigEndian.Uint32(dec[:4]) == MagicSignature {
+			if sSeq >= curr {
+				atomic.StoreUint32(seqPtr, sSeq+1)
+			}
+			return dec[4:], true
+		}
 	}
 	return nil, false
 }
 
-// --- System ---
+// --- System Networking & Lifecycle ---
+
 func configureSystem(name, localIP, peerIP string, isServer bool) (string, string) {
 	run := func(c string, args ...string) { _ = exec.Command(c, args...).Run() }
 	outFwd, _ := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
 	origForwarding = strings.TrimSpace(string(outFwd))
+
 	outRoute, _ := exec.Command("ip", "route", "show", "default").Output()
 	fields := strings.Fields(string(outRoute))
 	var gw, dev string
@@ -204,19 +186,22 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 		if f == "via" {
 			gw = fields[i+1]
 		}
-		if f == f && f == "dev" {
+		if f == "dev" {
 			dev = fields[i+1]
 		}
 	}
+
 	run("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU))
 	if localIP != "0.0.0.0" {
 		run("ip", "addr", "replace", localIP+"/24", "dev", name)
 	}
+
 	if isServer {
 		run("sysctl", "-w", "net.ipv4.ip_forward=1")
 		run("iptables", "-t", "nat", "-F")
 		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE")
-		run("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "600")
+		// MSS Clamping is vital for VPN stability
+		run("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "900")
 	} else if localIP != "0.0.0.0" && peerIP != "" {
 		run("ip", "route", "add", peerIP, "via", gw, "dev", dev)
 		run("ip", "route", "add", "0.0.0.0/1", "dev", name)
@@ -225,123 +210,105 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 	return gw, dev
 }
 
-func cleanup(name, peerIP, gw, dev string, isServer bool) {
-	run := func(c string, args ...string) { _ = exec.Command(c, args...).Run() }
-	run("sysctl", "-w", "net.ipv4.ip_forward="+origForwarding)
-	run("iptables", "-t", "nat", "-F")
-	run("iptables", "-t", "mangle", "-F")
+func cleanup(origFwd string) {
+	fmt.Println("\n[*] Restoring system networking...")
+	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward="+origFwd).Run()
+	_ = exec.Command("iptables", "-t", "nat", "-F").Run()
+	_ = exec.Command("iptables", "-t", "mangle", "-F").Run()
 	os.Exit(0)
 }
 
+func getHWID() string {
+	host, _ := os.Hostname()
+	h := sha256.Sum256([]byte(host))
+	return fmt.Sprintf("%x", h[:8])
+}
+
 func main() {
-	lPort := flag.String("l", "9000", "UDP Port")
-	tAddrStr := flag.String("t", "", "Target Host")
-	flag.StringVar(&basePass, "p", "BatMan", "Key")
-	tunIP := flag.String("ip", "10.0.0.1", "TUN IP")
+	lPort := flag.String("l", "9000", "Port")
+	tAddrStr := flag.String("t", "", "Target")
+	flag.StringVar(&basePass, "p", "Tetralogik@", "Key")
+	tunIP := flag.String("ip", "10.0.0.1", "Internal IP")
 	isServer := flag.Bool("server", false, "Server Mode")
 	flag.Parse()
 
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	cores := runtime.NumCPU()
+	runtime.GOMAXPROCS(cores)
+
 	tun, _ := water.New(water.Config{DeviceType: water.TUN})
 	pHost := ""
 	if *tAddrStr != "" {
 		pHost, _, _ = net.SplitHostPort(*tAddrStr)
 	}
-	gw, dev := configureSystem(tun.Name(), *tunIP, pHost, *isServer)
+	configureSystem(tun.Name(), *tunIP, pHost, *isServer)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() { <-sig; cleanup(tun.Name(), pHost, gw, dev, *isServer) }()
+	go func() { <-sig; cleanup(origForwarding) }()
 
 	lAddr, _ := net.ResolveUDPAddr("udp", ":"+*lPort)
 	conn, _ = net.ListenUDP("udp", lAddr)
+	_ = conn.SetReadBuffer(32 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(32 * 1024 * 1024)
 
-	// Dashboard
-	//go func() {
-	//	for {
-	//		time.Sleep(2 * time.Second)
-	//		fmt.Printf("\033[H\033[J")
-	//		fmt.Printf("=== WOLF VPN DASHBOARD (%s) ===\n", getHWID())
-	//		if *isServer {
-	//			mgr.mu.RLock()
-	//			fmt.Printf("Active Clients: %d\n", len(mgr.ByIP))
-	//			for ip, s := range mgr.ByIP {
-	//				fmt.Printf("[%s] HWID:%s | Last:%v | InMax:%d | Out:%d\n", ip, s.HWID, time.Since(time.Unix(s.LastSeen, 0)).Truncate(time.Second), s.Window.maxSeq, s.SeqOut)
-	//			}
-	//			mgr.mu.RUnlock()
-	//		} else {
-	//			fmt.Printf("Assigned IP: %s\n", myAssignedIP)
-	//			fmt.Printf("Inbound Max Seq: %d | Outbound Seq: %d\n", clientWindow.maxSeq, clientSeq)
-	//		}
-	//	}
-	//}()
-
-	// Workers
-	for i := 0; i < runtime.NumCPU(); i++ {
+	// Outbound Workers
+	for i := 0; i < cores; i++ {
 		go func() {
 			for job := range outboundChan {
-				stego := encode(job.payload, job.key, job.seq)
+				stego := encode6Bit(job.payload, job.key, job.seq)
 				conn.WriteToUDP(append([]byte{OP_DATA}, stego...), job.target)
-			}
-		}()
-		go func() {
-			for job := range inboundChan {
-				var uKey []byte
-				var win *ReplayWindow
-				mgr.mu.RLock()
-				if s, ok := mgr.ByAddr[job.from.String()]; ok {
-					uKey, win = s.UserKey, s.Window
-					atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
-				} else if !*isServer && myAssignedIP != "" {
-					uKey, win = deriveUserBaseKey(basePass, myAssignedIP), clientWindow
-				}
-				mgr.mu.RUnlock()
-				if uKey != nil {
-					if dec, ok := decode(job.data, uKey, win); ok {
-						tun.Write(dec)
-					}
-				}
+				bufferPool.Put(stego[:cap(stego)])
 			}
 		}()
 	}
 
-	// UDP Handler
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, rem, _ := conn.ReadFromUDP(buf)
-			switch buf[0] {
-			case OP_AUTH:
-				if *isServer {
-					id := string(buf[1:n])
-					mgr.mu.Lock()
-					s, exists := mgr.ByHWID[id]
-					if !exists {
-						newIP := fmt.Sprintf("10.0.0.%d", len(mgr.ByIP)+2)
-						s = &UserSession{Addr: rem, HWID: id, InternalIP: newIP, Window: &ReplayWindow{}, UserKey: deriveUserBaseKey(basePass, newIP), LastSeen: time.Now().Unix()}
-						mgr.ByIP[newIP] = s
-						mgr.ByHWID[id] = s
-					}
-					s.Addr = rem // Update physical address if it changed
-					mgr.ByAddr[rem.String()] = s
-					mgr.mu.Unlock()
-					conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(s.InternalIP)...), rem)
-				} else {
-					myAssignedIP = string(buf[1:n])
+	// Inbound Parallel Workers
+	for i := 0; i < cores; i++ {
+		go func() {
+			for {
+				buf := bufferPool.Get().([]byte)
+				n, rem, err := conn.ReadFromUDP(buf)
+				if err != nil {
+					continue
 				}
-			case OP_DATA:
-				inboundChan <- inboundJob{data: append([]byte(nil), buf[1:n]...), from: rem}
-			case OP_HEARTBEAT:
-				mgr.mu.RLock()
-				if s, ok := mgr.ByAddr[rem.String()]; ok {
-					atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
-				}
-				mgr.mu.RUnlock()
-			}
-		}
-	}()
 
-	// Heartbeat / Auth
+				switch buf[0] {
+				case OP_DATA:
+					var uKey []byte
+					var sPtr *uint32
+					if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+						s := val.(*UserSession)
+						uKey, sPtr = s.UserKey, &s.SeqIn
+						atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+					} else if !*isServer && myAssignedIP != "" {
+						k := sha256.Sum256([]byte(basePass + myAssignedIP))
+						uKey, sPtr = k[:], &serverSeq
+					}
+
+					if uKey != nil {
+						if dec, ok := decode6Bit(buf[1:n], uKey, sPtr); ok {
+							tun.Write(dec)
+						}
+					}
+				case OP_AUTH:
+					if *isServer {
+						hwid := string(buf[1:n])
+						newIP := fmt.Sprintf("10.0.0.%d", 2+atomic.AddInt64(&sessionCount, 1)-1)
+						k := sha256.Sum256([]byte(basePass + newIP))
+						s := &UserSession{Addr: rem, HWID: hwid, InternalIP: newIP, UserKey: k[:], LastSeen: time.Now().Unix()}
+						mgr.ByIP.Store(newIP, s)
+						mgr.ByHWID.Store(hwid, s)
+						mgr.ByAddr.Store(rem.String(), s)
+						conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(newIP)...), rem)
+					} else {
+						myAssignedIP = string(buf[1:n])
+					}
+				}
+				bufferPool.Put(buf[:cap(buf)])
+			}
+		}()
+	}
+
 	target, _ := net.ResolveUDPAddr("udp", *tAddrStr)
 	hwid := getHWID()
 	go func() {
@@ -357,21 +324,23 @@ func main() {
 		}
 	}()
 
-	pkt := make([]byte, 4096)
+	pkt := make([]byte, 2048)
 	for {
-		n, _ := tun.Read(pkt)
+		n, err := tun.Read(pkt)
+		if err != nil {
+			continue
+		}
 		if *isServer {
 			destIP := net.IP(pkt[16:20]).String()
-			mgr.mu.RLock()
-			u, ok := mgr.ByIP[destIP]
-			mgr.mu.RUnlock()
-			if ok {
+			if val, ok := mgr.ByIP.Load(destIP); ok {
+				u := val.(*UserSession)
 				s := atomic.AddUint32(&u.SeqOut, 1) - 1
 				outboundChan <- outboundJob{payload: append([]byte(nil), pkt[:n]...), target: u.Addr, seq: s, key: u.UserKey}
 			}
 		} else if myAssignedIP != "" {
 			s := atomic.AddUint32(&clientSeq, 1) - 1
-			outboundChan <- outboundJob{payload: append([]byte(nil), pkt[:n]...), target: target, seq: s, key: deriveUserBaseKey(basePass, myAssignedIP)}
+			k := sha256.Sum256([]byte(basePass + myAssignedIP))
+			outboundChan <- outboundJob{payload: append([]byte(nil), pkt[:n]...), target: target, seq: s, key: k[:]}
 		}
 	}
 }
