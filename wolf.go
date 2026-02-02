@@ -22,7 +22,7 @@ import (
 
 const (
 	MagicSignature  uint32 = 0xACE1FACE
-	TUN_MTU                = 680
+	TUN_MTU                = 1426
 	BMP_HEADER_SIZE        = 54
 	OP_DATA         byte   = 4
 	OP_AUTH         byte   = 5
@@ -124,13 +124,18 @@ func fastCrypt(data []byte, key []byte, seq uint32) {
 }
 
 func encode(msg []byte, key []byte, seq uint32) []byte {
+	// 1. Encapsulate and Encrypt
 	vault := make([]byte, 4+len(msg))
 	binary.BigEndian.PutUint32(vault[0:4], MagicSignature)
 	copy(vault[4:], msg)
 	fastCrypt(vault, key, seq)
+
 	dataLen := len(vault)
-	payloadArea := 16 + (dataLen * 2)
+	// Metadata (16) + Vault (dataLen) - No doubling!
+	payloadArea := 16 + dataLen
 	bmp := make([]byte, BMP_HEADER_SIZE+payloadArea)
+
+	// 2. BMP Header
 	copy(bmp[0:2], "BM")
 	binary.LittleEndian.PutUint32(bmp[2:6], uint32(len(bmp)))
 	binary.LittleEndian.PutUint32(bmp[10:14], uint32(BMP_HEADER_SIZE))
@@ -139,15 +144,21 @@ func encode(msg []byte, key []byte, seq uint32) []byte {
 	binary.LittleEndian.PutUint32(bmp[22:26], 1)
 	binary.LittleEndian.PutUint16(bmp[26:28], 1)
 	binary.LittleEndian.PutUint16(bmp[28:30], 24)
+
+	// 3. Pack Metadata (8 bits per byte)
 	hdr := make([]byte, 8)
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(dataLen))
 	binary.BigEndian.PutUint32(hdr[4:8], seq)
-	for i := 0; i < 16; i++ {
-		bmp[BMP_HEADER_SIZE+i] = (bmp[BMP_HEADER_SIZE+i] & 0xF0) | ((hdr[i/2] >> (uint(i%2) * 4)) & 0x0F)
+
+	// We use 2 bytes of BMP per 1 byte of header to keep metadata slightly
+	// more robust/spread out, or we can go full 1:1. Let's do 1:1 for max speed.
+	for i := 0; i < 8; i++ {
+		bmp[BMP_HEADER_SIZE+i] = hdr[i]
 	}
-	for i := 0; i < dataLen*2; i++ {
-		bmp[BMP_HEADER_SIZE+16+i] = (bmp[BMP_HEADER_SIZE+16+i] & 0xF0) | ((vault[i/2] >> (uint(i%2) * 4)) & 0x0F)
-	}
+
+	// 4. Inject Vault Data (1:1 Packing)
+	copy(bmp[BMP_HEADER_SIZE+16:], vault)
+
 	return bmp
 }
 
@@ -155,19 +166,25 @@ func decode(stego []byte, key []byte, window *ReplayWindow) ([]byte, bool) {
 	if len(stego) < BMP_HEADER_SIZE+16 {
 		return nil, false
 	}
-	var hdr [8]byte
-	for i := 0; i < 16; i++ {
-		hdr[i/2] |= (stego[BMP_HEADER_SIZE+i] & 0x0F) << (uint(i%2) * 4)
-	}
-	vLen := binary.BigEndian.Uint32(hdr[0:4])
-	seq := binary.BigEndian.Uint32(hdr[4:8])
-	if vLen == 0 || vLen > 1500 || !window.Verify(seq) {
+
+	// 1. Extract Metadata
+	vLen := binary.BigEndian.Uint32(stego[BMP_HEADER_SIZE : BMP_HEADER_SIZE+4])
+	seq := binary.BigEndian.Uint32(stego[BMP_HEADER_SIZE+4 : BMP_HEADER_SIZE+8])
+
+	// 2. Sliding window check
+	if vLen == 0 || vLen > 2000 || !window.Verify(seq) {
 		return nil, false
 	}
-	vault := make([]byte, vLen)
-	for i := 0; i < int(vLen)*2; i++ {
-		vault[i/2] |= (stego[BMP_HEADER_SIZE+16+i] & 0x0F) << (uint(i%2) * 4)
+
+	if int(BMP_HEADER_SIZE+16+vLen) > len(stego) {
+		return nil, false
 	}
+
+	// 3. Extract Vault
+	vault := make([]byte, vLen)
+	copy(vault, stego[BMP_HEADER_SIZE+16:BMP_HEADER_SIZE+16+vLen])
+
+	// 4. Decrypt and Verify
 	fastCrypt(vault, key, seq)
 	if binary.BigEndian.Uint32(vault[0:4]) == MagicSignature {
 		return vault[4:], true
@@ -240,24 +257,24 @@ func main() {
 	conn, _ = net.ListenUDP("udp", lAddr)
 
 	// Dashboard
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			fmt.Printf("\033[H\033[J")
-			fmt.Printf("=== WOLF VPN DASHBOARD (%s) ===\n", getHWID())
-			if *isServer {
-				mgr.mu.RLock()
-				fmt.Printf("Active Clients: %d\n", len(mgr.ByIP))
-				for ip, s := range mgr.ByIP {
-					fmt.Printf("[%s] HWID:%s | Last:%v | InMax:%d | Out:%d\n", ip, s.HWID, time.Since(time.Unix(s.LastSeen, 0)).Truncate(time.Second), s.Window.maxSeq, s.SeqOut)
-				}
-				mgr.mu.RUnlock()
-			} else {
-				fmt.Printf("Assigned IP: %s\n", myAssignedIP)
-				fmt.Printf("Inbound Max Seq: %d | Outbound Seq: %d\n", clientWindow.maxSeq, clientSeq)
-			}
-		}
-	}()
+	//go func() {
+	//	for {
+	//		time.Sleep(2 * time.Second)
+	//		fmt.Printf("\033[H\033[J")
+	//		fmt.Printf("=== WOLF VPN DASHBOARD (%s) ===\n", getHWID())
+	//		if *isServer {
+	//			mgr.mu.RLock()
+	//			fmt.Printf("Active Clients: %d\n", len(mgr.ByIP))
+	//			for ip, s := range mgr.ByIP {
+	//				fmt.Printf("[%s] HWID:%s | Last:%v | InMax:%d | Out:%d\n", ip, s.HWID, time.Since(time.Unix(s.LastSeen, 0)).Truncate(time.Second), s.Window.maxSeq, s.SeqOut)
+	//			}
+	//			mgr.mu.RUnlock()
+	//		} else {
+	//			fmt.Printf("Assigned IP: %s\n", myAssignedIP)
+	//			fmt.Printf("Inbound Max Seq: %d | Outbound Seq: %d\n", clientWindow.maxSeq, clientSeq)
+	//		}
+	//	}
+	//}()
 
 	// Workers
 	for i := 0; i < runtime.NumCPU(); i++ {
