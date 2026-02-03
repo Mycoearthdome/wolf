@@ -1,5 +1,5 @@
 [SERVER MODE]
-```sudo ./wolf -l 9000 -ip 10.0.0.1 -server```
+```sudo ./wolf -l 9000 -ip 10.0.0.1 -server -telemetry```
 
 [CLIENT MODE]
-```sudo ./wolf -l 9000 -ip [EXTERnAL IP]:9000 -ip 10.0.0.2```
+```sudo ./wolf -l 9000 -ip [EXTERnAL IP]:9000 -ip 10.0.0.2 -telemetry```
