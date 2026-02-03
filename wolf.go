@@ -1,11 +1,11 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -18,49 +18,50 @@ import (
 	"time"
 
 	"github.com/songgao/water"
-	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
-	MagicSignature  uint32 = 0xACE1FACE
-	TUN_MTU                = 1300
-	BMP_HEADER_SIZE        = 54
-	OP_DATA         byte   = 4
-	OP_AUTH         byte   = 5
-	OP_HEARTBEAT    byte   = 6
-	BAN_LIMIT              = 3
-	BAN_TTL                = 3600
+	TUN_MTU      = 1350
+	OP_DATA      = 4
+	OP_AUTH      = 5
+	OP_KEEPALIVE = 6
+	BAN_LIMIT    = 3
+	BAN_TTL      = 3600
 )
 
 var (
 	mgr                = &SessionManager{}
 	conn               *net.UDPConn
-	outboundChan       = make(chan outboundJob, 5000)
+	outboundChan       = make(chan outboundJob, 10000)
 	origForwarding     string
 	myAssignedIP       string
 	cachedClientKey    []byte
 	basePass           string
-	clientSeq          uint32
-	serverSeq          uint32
+	clientSeq          uint64
+	serverSeq          uint64
 	sessionCount       int64
 	lastServerActivity int64
+	ingressPackets     uint64
+	egressPackets      uint64
 	failCounter        = make(map[string]int)
 	banList            = make(map[string]int64)
 	securityLock       sync.RWMutex
 	bufferPool         = sync.Pool{
-		New: func() interface{} { return make([]byte, 65535) },
+		New: func() interface{} { return make([]byte, 2048) },
 	}
 )
 
 type UserSession struct {
-	Addr        *net.UDPAddr
-	HWID        string
-	InternalIP  string
-	SeqIn       uint32
-	SeqOut      uint32
-	LastSeen    int64
-	UserKey     []byte
-	PacketCount uint64
+	Addr       *net.UDPAddr
+	HWID       string
+	InternalIP string
+	SeqOut     uint64
+	LastSeen   int64
+	UserKey    []byte
+	AEAD       cipher.AEAD
+	PktsIn     uint64
+	PktsOut    uint64
 }
 
 type SessionManager struct {
@@ -73,107 +74,24 @@ type outboundJob struct {
 	payload []byte
 	n       int
 	target  *net.UDPAddr
-	seq     uint32
-	key     []byte
+	seq     uint64
+	aead    cipher.AEAD
 }
 
-// --- FastBit Wolfram-XOR Implementation ---
+// --- High-Speed Crypto ---
 
-func wolframChaCha(data []byte, key []byte, seq uint32) []byte {
-	h := sha256.Sum256(binary.BigEndian.AppendUint32(key, seq))
-	c, _ := chacha20.NewUnauthenticatedCipher(h[:32], h[20:32])
-	seed := int64(binary.BigEndian.Uint64(h[:8]))
-	rng := rand.New(rand.NewSource(seed))
-
-	for i := range data {
-		data[i] ^= uint8(rng.Intn(256))
-	}
-	c.XORKeyStream(data, data)
-	return data
+func fastWrap(data []byte, aead cipher.AEAD, seq uint64) []byte {
+	nonce := make([]byte, aead.NonceSize())
+	binary.BigEndian.PutUint64(nonce, seq)
+	return aead.Seal(nonce, nonce, data, nil)
 }
 
-func encode6Bit(msg []byte, key []byte, seq uint32) []byte {
-	payload := append(binary.BigEndian.AppendUint32(nil, MagicSignature), msg...)
-	encrypted := wolframChaCha(payload, key, seq)
-	vLen := uint32(len(encrypted))
-
-	full := make([]byte, 8+len(encrypted))
-	binary.BigEndian.PutUint32(full[0:4], vLen)
-	binary.BigEndian.PutUint32(full[4:8], seq)
-	copy(full[8:], encrypted)
-
-	bmpBodyLen := (len(full)*8 + 5) / 6
-	bmp := bufferPool.Get().([]byte)[:BMP_HEADER_SIZE+bmpBodyLen]
-
-	copy(bmp[0:2], "BM")
-	binary.LittleEndian.PutUint32(bmp[2:6], uint32(len(bmp)))
-	binary.LittleEndian.PutUint32(bmp[10:14], uint32(BMP_HEADER_SIZE))
-	binary.LittleEndian.PutUint32(bmp[14:18], 40)
-	binary.LittleEndian.PutUint32(bmp[18:22], uint32(bmpBodyLen/3))
-	binary.LittleEndian.PutUint32(bmp[22:26], 1)
-	binary.LittleEndian.PutUint16(bmp[26:28], 1)
-	binary.LittleEndian.PutUint16(bmp[28:30], 24)
-
-	var bitBuf uint64
-	var bitCount uint
-	cursor := BMP_HEADER_SIZE
-	for _, b := range full {
-		bitBuf = (bitBuf << 8) | uint64(b)
-		bitCount += 8
-		for bitCount >= 6 {
-			bitCount -= 6
-			bmp[cursor] = 0x40 | uint8((bitBuf>>bitCount)&0x3F)
-			cursor++
-		}
+func fastUnwrap(raw []byte, aead cipher.AEAD) ([]byte, error) {
+	if len(raw) < 24 {
+		return nil, fmt.Errorf("packet short")
 	}
-	if bitCount > 0 {
-		bmp[cursor] = 0x40 | uint8((bitBuf<<(6-bitCount))&0x3F)
-	}
-	return bmp
-}
-
-func decode6Bit(stego []byte, key []byte, seqPtr *uint32) ([]byte, bool) {
-	if len(stego) < BMP_HEADER_SIZE+12 {
-		return nil, false
-	}
-	rawLen := len(stego) - BMP_HEADER_SIZE
-	bitStream := make([]byte, (rawLen*6)/8)
-	var bitBuf uint64
-	var bitCount uint
-	writePtr := 0
-	for i := 0; i < rawLen; i++ {
-		bitBuf = (bitBuf << 6) | uint64(stego[BMP_HEADER_SIZE+i]&0x3F)
-		bitCount += 6
-		if bitCount >= 8 {
-			bitCount -= 8
-			if writePtr < len(bitStream) {
-				bitStream[writePtr] = uint8(bitBuf >> bitCount)
-				writePtr++
-			}
-		}
-	}
-	if len(bitStream) < 8 {
-		return nil, false
-	}
-	vLen := binary.BigEndian.Uint32(bitStream[0:4])
-	rSeq := binary.BigEndian.Uint32(bitStream[4:8])
-	if vLen == 0 || int(8+vLen) > len(bitStream) {
-		return nil, false
-	}
-	vault := bitStream[8 : 8+vLen]
-	curr := atomic.LoadUint32(seqPtr)
-	for o := -10; o <= 10; o++ {
-		sSeq := uint32(int(rSeq) + o)
-		testVault := append([]byte(nil), vault...)
-		dec := wolframChaCha(testVault, key, sSeq)
-		if len(dec) > 4 && binary.BigEndian.Uint32(dec[:4]) == MagicSignature {
-			if sSeq >= curr {
-				atomic.StoreUint32(seqPtr, sSeq+1)
-			}
-			return dec[4:], true
-		}
-	}
-	return nil, false
+	nonce := raw[:aead.NonceSize()]
+	return aead.Open(nil, nonce, raw[aead.NonceSize():], nil)
 }
 
 // --- System Config & Security ---
@@ -185,7 +103,6 @@ func banIP(remoteAddr string) {
 	securityLock.Lock()
 	defer securityLock.Unlock()
 	if _, banned := banList[host]; !banned {
-		fmt.Printf("[!] Banning %s for 1 hour\n", host)
 		runCmd("iptables", "-I", "INPUT", "1", "-s", host, "-j", "DROP")
 		banList[host] = time.Now().Unix() + BAN_TTL
 	}
@@ -210,18 +127,31 @@ func manageBans() {
 
 func startTelemetry(isServer bool) {
 	go func() {
-		for range time.Tick(2 * time.Second) {
-			fmt.Print("\033[H\033[2J")
-			fmt.Printf("=== VPN DASHBOARD [%s] ===\n", time.Now().Format("15:04:05"))
+		for range time.Tick(time.Second) {
+			fmt.Print("\033[H\033[2J") // Clear screen
+			fmt.Printf("=== VPN TELEMETRY [%s] ===\n", time.Now().Format("15:04:05"))
+			fmt.Printf("Global Ingress: %d | Global Egress: %d\n", atomic.LoadUint64(&ingressPackets), atomic.LoadUint64(&egressPackets))
+			fmt.Println(strings.Repeat("-", 60))
+
 			if isServer {
-				fmt.Printf("%-15s | %-15s | %-8s | %s\n", "INT IP", "REMOTE", "PKTS", "HWID")
+				fmt.Printf("%-15s | %-18s | %-8s | %-8s | %-10s\n", "INTERNAL IP", "REMOTE ADDR", "IN", "OUT", "STATUS")
 				mgr.ByHWID.Range(func(k, v interface{}) bool {
 					s := v.(*UserSession)
-					fmt.Printf("%-15s | %-15s | %-8d | %s\n", s.InternalIP, s.Addr.String(), atomic.LoadUint64(&s.PacketCount), s.HWID)
+					status := "ACTIVE"
+					if time.Now().Unix()-atomic.LoadInt64(&s.LastSeen) > 30 {
+						status = "STALE"
+					}
+					fmt.Printf("%-15s | %-18s | %-8d | %-8d | %-10s\n", s.InternalIP, s.Addr.String(), atomic.LoadUint64(&s.PktsIn), atomic.LoadUint64(&s.PktsOut), status)
 					return true
 				})
 			} else {
-				fmt.Printf("Status: Connected [%s] | Activity: %ds ago\n", myAssignedIP, time.Now().Unix()-atomic.LoadInt64(&lastServerActivity))
+				lastSeen := time.Now().Unix() - atomic.LoadInt64(&lastServerActivity)
+				status := "CONNECTED"
+				if lastSeen > 30 {
+					status = "RECONNECTING"
+				}
+				fmt.Printf("Assigned IP: %s\n", myAssignedIP)
+				fmt.Printf("Gateway Status: %s (Last activity: %ds ago)\n", status, lastSeen)
 			}
 		}
 	}()
@@ -266,24 +196,10 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 }
 
 func cleanup(origFwd string) {
-	fmt.Println("\n[*] Restoring networking...")
-	securityLock.Lock()
-	for ip := range banList {
-		runCmd("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP")
-	}
-	securityLock.Unlock()
 	_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
 	runCmd("iptables", "-D", "OUTPUT", "-j", "VPN_KILLSWITCH")
-	runCmd("iptables", "-F", "VPN_KILLSWITCH")
-	runCmd("iptables", "-X", "VPN_KILLSWITCH")
 	runCmd("sysctl", "-w", "net.ipv4.ip_forward="+origFwd)
 	os.Exit(0)
-}
-
-func getHWID() string {
-	host, _ := os.Hostname()
-	h := sha256.Sum256([]byte(host))
-	return fmt.Sprintf("%x", h[:8])
 }
 
 // --- Main Engine ---
@@ -291,10 +207,10 @@ func getHWID() string {
 func main() {
 	lPort := flag.String("l", "9000", "Local Port")
 	tAddrStr := flag.String("t", "", "Target Host:Port")
-	flag.StringVar(&basePass, "p", "BatMan", "Secret Key")
+	flag.StringVar(&basePass, "p", "Batman", "Secret Key")
 	tunIP := flag.String("ip", "10.0.0.1", "Internal IP")
 	isServer := flag.Bool("server", false, "Server Mode")
-	telemetry := flag.Bool("telemetry", false, "telemetry dashboard")
+	telemetry := flag.Bool("telemetry", false, "Enable Dashboard")
 	flag.Parse()
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -314,33 +230,22 @@ func main() {
 
 	if *isServer {
 		manageBans()
-		go func() {
-			for range time.Tick(30 * time.Second) {
-				now := time.Now().Unix()
-				mgr.ByHWID.Range(func(k, v interface{}) bool {
-					s := v.(*UserSession)
-					if now-atomic.LoadInt64(&s.LastSeen) > 300 {
-						mgr.ByHWID.Delete(s.HWID)
-						mgr.ByIP.Delete(s.InternalIP)
-						mgr.ByAddr.Delete(s.Addr.String())
-					}
-					return true
-				})
-			}
-		}()
 	}
-
 	if *telemetry {
 		startTelemetry(*isServer)
 	}
 
+	target, _ := net.ResolveUDPAddr("udp", *tAddrStr)
+	host, _ := os.Hostname()
+
+	// Workers
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
 			for job := range outboundChan {
-				stego := encode6Bit(job.payload[:job.n], job.key, job.seq)
-				conn.WriteToUDP(append([]byte{OP_DATA}, stego...), job.target)
+				wrapped := fastWrap(job.payload[:job.n], job.aead, job.seq)
+				conn.WriteToUDP(append([]byte{OP_DATA}, wrapped...), job.target)
+				atomic.AddUint64(&egressPackets, 1)
 				bufferPool.Put(job.payload)
-				bufferPool.Put(stego[:cap(stego)])
 			}
 		}()
 
@@ -348,64 +253,66 @@ func main() {
 			for {
 				buf := bufferPool.Get().([]byte)
 				n, rem, err := conn.ReadFromUDP(buf)
-				if err != nil {
+				if err != nil || n < 1 {
 					bufferPool.Put(buf)
 					continue
 				}
-				atomic.StoreInt64(&lastServerActivity, time.Now().Unix())
 
 				switch buf[0] {
 				case OP_DATA:
-					remoteStr := rem.String()
-					var success bool
-					if val, ok := mgr.ByAddr.Load(remoteStr); ok {
-						s := val.(*UserSession)
-						if dec, ok := decode6Bit(buf[1:n], s.UserKey, &s.SeqIn); ok {
-							success = true
+					var aead cipher.AEAD
+					if *isServer {
+						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+							s := val.(*UserSession)
+							aead = s.AEAD
 							atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
-							atomic.AddUint64(&s.PacketCount, 1)
-							tun.Write(dec)
-							securityLock.Lock()
-							delete(failCounter, remoteStr)
-							securityLock.Unlock()
+							atomic.AddUint64(&s.PktsIn, 1)
 						}
-					} else if !*isServer && myAssignedIP != "" {
-						if cachedClientKey == nil {
-							k := sha256.Sum256([]byte(basePass + myAssignedIP))
-							cachedClientKey = k[:]
-						}
-						if dec, ok := decode6Bit(buf[1:n], cachedClientKey, &serverSeq); ok {
+					} else if cachedClientKey != nil {
+						aead, _ = chacha20poly1305.New(cachedClientKey)
+						atomic.StoreInt64(&lastServerActivity, time.Now().Unix())
+					}
+					if aead != nil {
+						if dec, err := fastUnwrap(buf[1:n], aead); err == nil {
+							atomic.AddUint64(&ingressPackets, 1)
 							tun.Write(dec)
 						}
 					}
-					if !success && *isServer {
-						securityLock.Lock()
-						failCounter[remoteStr]++
-						if failCounter[remoteStr] >= BAN_LIMIT {
-							banIP(remoteStr)
+				case OP_KEEPALIVE:
+					if *isServer {
+						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+							s := val.(*UserSession)
+							atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+							conn.WriteToUDP([]byte{OP_KEEPALIVE}, rem)
 						}
-						securityLock.Unlock()
+					} else {
+						atomic.StoreInt64(&lastServerActivity, time.Now().Unix())
 					}
 				case OP_AUTH:
-					data := string(buf[1:n])
 					if *isServer {
+						hwid := string(buf[1:n])
 						var s *UserSession
-						if val, ok := mgr.ByHWID.Load(data); ok {
+						if val, ok := mgr.ByHWID.Load(hwid); ok {
 							s = val.(*UserSession)
 							mgr.ByAddr.Delete(s.Addr.String())
 							s.Addr = rem
 						} else {
 							newIP := fmt.Sprintf("10.0.0.%d", 2+atomic.AddInt64(&sessionCount, 1)-1)
-							k := sha256.Sum256([]byte(basePass + newIP))
-							s = &UserSession{Addr: rem, HWID: data, InternalIP: newIP, UserKey: k[:], LastSeen: time.Now().Unix()}
-							mgr.ByHWID.Store(data, s)
+							key := sha256.Sum256([]byte(basePass + newIP))
+							aead, _ := chacha20poly1305.New(key[:])
+							s = &UserSession{Addr: rem, HWID: hwid, InternalIP: newIP, UserKey: key[:], AEAD: aead}
+							mgr.ByHWID.Store(hwid, s)
 							mgr.ByIP.Store(newIP, s)
 						}
 						mgr.ByAddr.Store(rem.String(), s)
+						atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
 						conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(s.InternalIP)...), rem)
 					} else {
-						myAssignedIP = data
-						runCmd("ip", "addr", "replace", data+"/24", "dev", tun.Name())
+						myAssignedIP = string(buf[1:n])
+						k := sha256.Sum256([]byte(basePass + myAssignedIP))
+						cachedClientKey = k[:]
+						runCmd("ip", "addr", "replace", myAssignedIP+"/24", "dev", tun.Name())
+						atomic.StoreInt64(&lastServerActivity, time.Now().Unix())
 					}
 				}
 				bufferPool.Put(buf[:cap(buf)])
@@ -413,15 +320,15 @@ func main() {
 		}()
 	}
 
-	target, _ := net.ResolveUDPAddr("udp", *tAddrStr)
-	hwid := getHWID()
+	// Keepalive
 	go func() {
-		for range time.Tick(5 * time.Second) {
+		for range time.Tick(10 * time.Second) {
 			if !*isServer && *tAddrStr != "" {
-				if time.Now().Unix()-atomic.LoadInt64(&lastServerActivity) > 15 {
-					conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(hwid)...), target)
-				} else if myAssignedIP != "" {
-					conn.WriteToUDP([]byte{OP_HEARTBEAT}, target)
+				now := time.Now().Unix()
+				if now-atomic.LoadInt64(&lastServerActivity) > 30 || myAssignedIP == "" {
+					conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(host)...), target)
+				} else {
+					conn.WriteToUDP([]byte{OP_KEEPALIVE}, target)
 				}
 			}
 		}
@@ -431,7 +338,6 @@ func main() {
 		pkt := bufferPool.Get().([]byte)
 		n, err := tun.Read(pkt)
 		if err != nil {
-			bufferPool.Put(pkt)
 			continue
 		}
 		if *isServer {
@@ -441,16 +347,12 @@ func main() {
 			destIP := net.IP(pkt[16:20]).String()
 			if val, ok := mgr.ByIP.Load(destIP); ok {
 				u := val.(*UserSession)
-				outboundChan <- outboundJob{payload: pkt, n: n, target: u.Addr, seq: atomic.AddUint32(&u.SeqOut, 1) - 1, key: u.UserKey}
-			} else {
-				bufferPool.Put(pkt)
+				atomic.AddUint64(&u.PktsOut, 1)
+				outboundChan <- outboundJob{payload: pkt, n: n, target: u.Addr, seq: atomic.AddUint64(&u.SeqOut, 1), aead: u.AEAD}
 			}
-		} else if myAssignedIP != "" {
-			if cachedClientKey == nil {
-				k := sha256.Sum256([]byte(basePass + myAssignedIP))
-				cachedClientKey = k[:]
-			}
-			outboundChan <- outboundJob{payload: pkt, n: n, target: target, seq: atomic.AddUint32(&clientSeq, 1) - 1, key: cachedClientKey}
+		} else if cachedClientKey != nil {
+			aead, _ := chacha20poly1305.New(cachedClientKey)
+			outboundChan <- outboundJob{payload: pkt, n: n, target: target, seq: atomic.AddUint64(&clientSeq, 1), aead: aead}
 		}
 	}
 }
