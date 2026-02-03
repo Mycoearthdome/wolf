@@ -103,6 +103,7 @@ func banIP(remoteAddr string) {
 	securityLock.Lock()
 	defer securityLock.Unlock()
 	if _, banned := banList[host]; !banned {
+		fmt.Printf("[!] SECURITY: Banning %s for 1 hour\n", host)
 		runCmd("iptables", "-I", "INPUT", "1", "-s", host, "-j", "DROP")
 		banList[host] = time.Now().Unix() + BAN_TTL
 	}
@@ -128,7 +129,7 @@ func manageBans() {
 func startTelemetry(isServer bool) {
 	go func() {
 		for range time.Tick(time.Second) {
-			fmt.Print("\033[H\033[2J") // Clear screen
+			fmt.Print("\033[H\033[2J")
 			fmt.Printf("=== VPN TELEMETRY [%s] ===\n", time.Now().Format("15:04:05"))
 			fmt.Printf("Global Ingress: %d | Global Egress: %d\n", atomic.LoadUint64(&ingressPackets), atomic.LoadUint64(&egressPackets))
 			fmt.Println(strings.Repeat("-", 60))
@@ -150,8 +151,7 @@ func startTelemetry(isServer bool) {
 				if lastSeen > 30 {
 					status = "RECONNECTING"
 				}
-				fmt.Printf("Assigned IP: %s\n", myAssignedIP)
-				fmt.Printf("Gateway Status: %s (Last activity: %ds ago)\n", status, lastSeen)
+				fmt.Printf("Assigned IP: %s\nGateway: %s (Last: %ds ago)\n", myAssignedIP, status, lastSeen)
 			}
 		}
 	}()
@@ -196,6 +196,11 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 }
 
 func cleanup(origFwd string) {
+	securityLock.Lock()
+	for ip := range banList {
+		runCmd("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP")
+	}
+	securityLock.Unlock()
 	_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
 	runCmd("iptables", "-D", "OUTPUT", "-j", "VPN_KILLSWITCH")
 	runCmd("sysctl", "-w", "net.ipv4.ip_forward="+origFwd)
@@ -205,12 +210,12 @@ func cleanup(origFwd string) {
 // --- Main Engine ---
 
 func main() {
-	lPort := flag.String("l", "9000", "Local Port")
-	tAddrStr := flag.String("t", "", "Target Host:Port")
-	flag.StringVar(&basePass, "p", "Batman", "Secret Key")
+	lPort := flag.String("l", "9000", "Port")
+	tAddrStr := flag.String("t", "", "Target")
+	flag.StringVar(&basePass, "p", "@DisfavorableHonor#", "Secret")
 	tunIP := flag.String("ip", "10.0.0.1", "Internal IP")
 	isServer := flag.Bool("server", false, "Server Mode")
-	telemetry := flag.Bool("telemetry", false, "Enable Dashboard")
+	telemetry := flag.Bool("telemetry", false, "Dashboard")
 	flag.Parse()
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -238,7 +243,6 @@ func main() {
 	target, _ := net.ResolveUDPAddr("udp", *tAddrStr)
 	host, _ := os.Hostname()
 
-	// Workers
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
 			for job := range outboundChan {
@@ -258,31 +262,48 @@ func main() {
 					continue
 				}
 
+				remoteStr := rem.String()
 				switch buf[0] {
 				case OP_DATA:
 					var aead cipher.AEAD
 					if *isServer {
-						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+						if val, ok := mgr.ByAddr.Load(remoteStr); ok {
 							s := val.(*UserSession)
 							aead = s.AEAD
 							atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
-							atomic.AddUint64(&s.PktsIn, 1)
 						}
 					} else if cachedClientKey != nil {
 						aead, _ = chacha20poly1305.New(cachedClientKey)
 						atomic.StoreInt64(&lastServerActivity, time.Now().Unix())
 					}
+
 					if aead != nil {
 						if dec, err := fastUnwrap(buf[1:n], aead); err == nil {
 							atomic.AddUint64(&ingressPackets, 1)
+							if *isServer {
+								if val, ok := mgr.ByAddr.Load(remoteStr); ok {
+									atomic.AddUint64(&val.(*UserSession).PktsIn, 1)
+								}
+							}
 							tun.Write(dec)
+							// Reset fail counter on success
+							securityLock.Lock()
+							delete(failCounter, remoteStr)
+							securityLock.Unlock()
+						} else if *isServer {
+							// CRITICAL: TRIGGER BAN ON FAILED DECRYPT
+							securityLock.Lock()
+							failCounter[remoteStr]++
+							if failCounter[remoteStr] >= BAN_LIMIT {
+								banIP(remoteStr)
+							}
+							securityLock.Unlock()
 						}
 					}
 				case OP_KEEPALIVE:
 					if *isServer {
-						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
-							s := val.(*UserSession)
-							atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+						if val, ok := mgr.ByAddr.Load(remoteStr); ok {
+							atomic.StoreInt64(&val.(*UserSession).LastSeen, time.Now().Unix())
 							conn.WriteToUDP([]byte{OP_KEEPALIVE}, rem)
 						}
 					} else {
@@ -304,7 +325,7 @@ func main() {
 							mgr.ByHWID.Store(hwid, s)
 							mgr.ByIP.Store(newIP, s)
 						}
-						mgr.ByAddr.Store(rem.String(), s)
+						mgr.ByAddr.Store(remoteStr, s)
 						atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
 						conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(s.InternalIP)...), rem)
 					} else {
@@ -320,7 +341,6 @@ func main() {
 		}()
 	}
 
-	// Keepalive
 	go func() {
 		for range time.Tick(10 * time.Second) {
 			if !*isServer && *tAddrStr != "" {
