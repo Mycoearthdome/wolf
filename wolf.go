@@ -148,8 +148,10 @@ func startTelemetry(isServer bool) {
 }
 
 func configureSystem(name, localIP, peerIP string, isServer bool) (string, string) {
+	// 1. Detect Network Environment
 	outFwd, _ := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
 	origForwarding = strings.TrimSpace(string(outFwd))
+
 	outRoute, _ := exec.Command("ip", "route", "show", "default").Output()
 	fields := strings.Fields(string(outRoute))
 	var gw, dev string
@@ -161,24 +163,50 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 			dev = fields[i+1]
 		}
 	}
+
+	// 2. Interface Setup
 	runCmd("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU))
 	if localIP != "0.0.0.0" {
 		runCmd("ip", "addr", "replace", localIP+"/24", "dev", name)
 	}
+
 	if isServer {
+		// --- SERVER CONFIG ---
 		runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
+
+		// NAT and MSS Clamping
 		runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE")
 		runCmd("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1260")
-		runCmd("iptables", "-A", "FORWARD", "-i", name, "-j", "ACCEPT")
+
+		// Stateful Forwarding (The secret to Ingress)
+		runCmd("iptables", "-A", "FORWARD", "-i", name, "-o", dev, "-j", "ACCEPT")
+		runCmd("iptables", "-A", "FORWARD", "-i", dev, "-o", name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+
 	} else if localIP != "0.0.0.0" && peerIP != "" {
+		// --- CLIENT CONFIG ---
+		// Route to the VPN server via physical gateway
 		runCmd("ip", "route", "add", peerIP, "via", gw, "dev", dev, "metric", "1")
+
+		// DNS Redirection
 		_ = exec.Command("mv", "/etc/resolv.conf", "/etc/resolv.conf.bak").Run()
 		_ = exec.Command("bash", "-c", "echo 'nameserver 8.8.8.8' > /etc/resolv.conf").Run()
+
+		// Killswitch Logic
 		runCmd("iptables", "-N", "VPN_KILLSWITCH")
 		runCmd("iptables", "-I", "OUTPUT", "1", "-j", "VPN_KILLSWITCH")
+
+		// Allow Loopback
+		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-o", "lo", "-j", "ACCEPT")
+		// Allow Encrypted Handshake to Server
 		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-d", peerIP, "-p", "udp", "-j", "ACCEPT")
+		// Allow DNS (Required to find the server or resolve via tunnel)
+		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+		// Allow all traffic through the TUN device
 		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-o", name, "-j", "ACCEPT")
+		// Drop everything else
 		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-j", "DROP")
+
+		// Route all internet traffic through the TUN
 		runCmd("ip", "route", "add", "0.0.0.0/1", "dev", name, "metric", "5")
 		runCmd("ip", "route", "add", "128.0.0.0/1", "dev", name, "metric", "5")
 	}
@@ -188,19 +216,27 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 func cleanup(origFwd string, isServer bool) {
 	fmt.Println("\n[*] Cleaning up networking and security rules...")
 
-	// 1. Remove all active bans
+	// 1. Flush Security Bans
 	securityLock.Lock()
 	for ip := range banList {
 		runCmd("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP")
 	}
 	securityLock.Unlock()
 
-	// 2. Killswitch removal (Client side)
-	if !isServer {
+	if isServer {
+		// Find and remove NAT/Forwarding rules to prevent rule bloating
+		runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "1") // Simplistic; assumes first rule
+		runCmd("iptables", "-D", "FORWARD", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	} else {
+		// 2. Killswitch removal (Client side)
 		runCmd("iptables", "-D", "OUTPUT", "-j", "VPN_KILLSWITCH")
 		runCmd("iptables", "-F", "VPN_KILLSWITCH")
 		runCmd("iptables", "-X", "VPN_KILLSWITCH")
-		_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
+
+		// Restore DNS
+		if _, err := os.Stat("/etc/resolv.conf.bak"); err == nil {
+			_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
+		}
 	}
 
 	// 3. Restore global forwarding
@@ -215,7 +251,7 @@ func cleanup(origFwd string, isServer bool) {
 func main() {
 	lPort := flag.String("l", "9000", "Port")
 	tAddrStr := flag.String("t", "", "Target")
-	flag.StringVar(&basePass, "p", "@DisfavorableHonor#", "Secret")
+	flag.StringVar(&basePass, "p", "BatMan", "Secret")
 	tunIP := flag.String("ip", "10.0.0.1", "Internal IP")
 	isServer := flag.Bool("server", false, "Server Mode")
 	telemetry := flag.Bool("telemetry", false, "Dashboard")
