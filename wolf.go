@@ -103,7 +103,7 @@ func banIP(remoteAddr string) {
 	securityLock.Lock()
 	defer securityLock.Unlock()
 	if _, banned := banList[host]; !banned {
-		fmt.Printf("[!] SECURITY: Banning %s for 1 hour\n", host)
+		fmt.Printf("[!] SECURITY: Banning %s\n", host)
 		runCmd("iptables", "-I", "INPUT", "1", "-s", host, "-j", "DROP")
 		banList[host] = time.Now().Unix() + BAN_TTL
 	}
@@ -131,27 +131,17 @@ func startTelemetry(isServer bool) {
 		for range time.Tick(time.Second) {
 			fmt.Print("\033[H\033[2J")
 			fmt.Printf("=== VPN TELEMETRY [%s] ===\n", time.Now().Format("15:04:05"))
-			fmt.Printf("Global Ingress: %d | Global Egress: %d\n", atomic.LoadUint64(&ingressPackets), atomic.LoadUint64(&egressPackets))
+			fmt.Printf("G-Ingress: %d | G-Egress: %d\n", atomic.LoadUint64(&ingressPackets), atomic.LoadUint64(&egressPackets))
 			fmt.Println(strings.Repeat("-", 60))
-
 			if isServer {
-				fmt.Printf("%-15s | %-18s | %-8s | %-8s | %-10s\n", "INTERNAL IP", "REMOTE ADDR", "IN", "OUT", "STATUS")
+				fmt.Printf("%-15s | %-18s | %-8s | %-8s | %-10s\n", "INT IP", "REMOTE", "IN", "OUT", "STATUS")
 				mgr.ByHWID.Range(func(k, v interface{}) bool {
 					s := v.(*UserSession)
-					status := "ACTIVE"
-					if time.Now().Unix()-atomic.LoadInt64(&s.LastSeen) > 30 {
-						status = "STALE"
-					}
-					fmt.Printf("%-15s | %-18s | %-8d | %-8d | %-10s\n", s.InternalIP, s.Addr.String(), atomic.LoadUint64(&s.PktsIn), atomic.LoadUint64(&s.PktsOut), status)
+					fmt.Printf("%-15s | %-18s | %-8d | %-8d | %-10s\n", s.InternalIP, s.Addr.String(), atomic.LoadUint64(&s.PktsIn), atomic.LoadUint64(&s.PktsOut), "ACTIVE")
 					return true
 				})
 			} else {
-				lastSeen := time.Now().Unix() - atomic.LoadInt64(&lastServerActivity)
-				status := "CONNECTED"
-				if lastSeen > 30 {
-					status = "RECONNECTING"
-				}
-				fmt.Printf("Assigned IP: %s\nGateway: %s (Last: %ds ago)\n", myAssignedIP, status, lastSeen)
+				fmt.Printf("Assigned IP: %s\nLast Activity: %ds ago\n", myAssignedIP, time.Now().Unix()-atomic.LoadInt64(&lastServerActivity))
 			}
 		}
 	}()
@@ -195,15 +185,28 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 	return gw, dev
 }
 
-func cleanup(origFwd string) {
+func cleanup(origFwd string, isServer bool) {
+	fmt.Println("\n[*] Cleaning up networking and security rules...")
+
+	// 1. Remove all active bans
 	securityLock.Lock()
 	for ip := range banList {
 		runCmd("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP")
 	}
 	securityLock.Unlock()
-	_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
-	runCmd("iptables", "-D", "OUTPUT", "-j", "VPN_KILLSWITCH")
+
+	// 2. Killswitch removal (Client side)
+	if !isServer {
+		runCmd("iptables", "-D", "OUTPUT", "-j", "VPN_KILLSWITCH")
+		runCmd("iptables", "-F", "VPN_KILLSWITCH")
+		runCmd("iptables", "-X", "VPN_KILLSWITCH")
+		_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
+	}
+
+	// 3. Restore global forwarding
 	runCmd("sysctl", "-w", "net.ipv4.ip_forward="+origFwd)
+
+	fmt.Println("[+] Cleanup complete. Exiting.")
 	os.Exit(0)
 }
 
@@ -226,9 +229,13 @@ func main() {
 	}
 	configureSystem(tun.Name(), *tunIP, pHost, *isServer)
 
+	// Enhanced Signal Handling
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() { <-sig; cleanup(origForwarding) }()
+	go func() {
+		<-sig
+		cleanup(origForwarding, *isServer)
+	}()
 
 	lAddr, _ := net.ResolveUDPAddr("udp", ":"+*lPort)
 	conn, _ = net.ListenUDP("udp", lAddr)
@@ -286,12 +293,10 @@ func main() {
 								}
 							}
 							tun.Write(dec)
-							// Reset fail counter on success
 							securityLock.Lock()
 							delete(failCounter, remoteStr)
 							securityLock.Unlock()
 						} else if *isServer {
-							// CRITICAL: TRIGGER BAN ON FAILED DECRYPT
 							securityLock.Lock()
 							failCounter[remoteStr]++
 							if failCounter[remoteStr] >= BAN_LIMIT {
