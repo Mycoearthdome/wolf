@@ -798,6 +798,10 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			return true
 		})
 		fmt.Println("[SYS] Traffic statistics purged by administrator")
+
+	case "shutdown":
+		fmt.Println("[SYS] Daemon shutdown by administrator")
+		os.Exit(0)
 	}
 	w.WriteHeader(http.StatusOK)
 }
