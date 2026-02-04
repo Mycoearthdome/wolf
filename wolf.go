@@ -2,11 +2,16 @@ package main
 
 import (
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,18 +24,16 @@ import (
 
 	"github.com/songgao/water"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 )
 
-// --- Constants & Config ---
-
+// --- Constants ---
 const (
 	TUN_MTU     = 1350
-	HDR_SIZE    = 1  // OpCode
-	NONCE_SIZE  = 12 // ChaCha20 Nonce (4-byte Salt + 8-byte Seq)
-	TAG_SIZE    = 16 // Poly1305 MAC
-	OVERHEAD    = HDR_SIZE + NONCE_SIZE + TAG_SIZE
+	OVERHEAD    = 1 + 12 + 16
 	WINDOW_SIZE = 64
-	SESSION_TTL = 300 // 5 minutes
+	SESSION_TTL = 300 // 5 Minutes of inactivity triggers the Reaper
+	UPNP_LEASE  = 3600
 )
 
 const (
@@ -39,20 +42,54 @@ const (
 	OP_KEEPALIVE
 )
 
-// --- Session & Security Types ---
-
 type UserSession struct {
 	Addr       *net.UDPAddr
-	HWID       string
 	InternalIP string
 	SeqOut     uint64
 	LastSeen   int64
 	AEAD       cipher.AEAD
+	mu         sync.Mutex
+	lastSeqIn  uint64
+	window     uint64
+}
 
-	// Anti-Replay Sliding Window
-	mu        sync.Mutex
-	lastSeqIn uint64
-	window    uint64
+type SessionManager struct {
+	ByIdentity sync.Map
+	ByAddr     sync.Map
+	ByIP       sync.Map
+}
+
+var (
+	startTime      = time.Now()
+	mgr            = &SessionManager{}
+	conn           *net.UDPConn
+	origForwarding string
+	clientAEAD     atomic.Value
+	clientSeq      uint64
+	lastActivity   int64
+	bufferPool     = sync.Pool{New: func() interface{} { return make([]byte, 2048) }}
+)
+
+// --- Helper Functions ---
+
+func runCmd(c string, args ...string) { _ = exec.Command(c, args...).Run() }
+
+func generateKeys() (priv, pub [32]byte) {
+	io.ReadFull(rand.Reader, priv[:])
+	curve25519.ScalarBaseMult(&pub, &priv)
+	return
+}
+
+func deriveKey(priv, peerPub [32]byte) []byte {
+	secret, _ := curve25519.X25519(priv[:], peerPub[:])
+	hash := sha256.Sum256(secret)
+	return hash[:]
+}
+
+func signAuth(key []byte, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
 }
 
 func (s *UserSession) VerifySeq(seq uint64) bool {
@@ -76,54 +113,26 @@ func (s *UserSession) VerifySeq(seq uint64) bool {
 	return true
 }
 
-type SessionManager struct {
-	ByIP   sync.Map
-	ByAddr sync.Map
-	ByHWID sync.Map
-}
-
-// --- Global State ---
-
-var (
-	mgr            = &SessionManager{}
-	conn           *net.UDPConn
-	origForwarding string
-	myAssignedIP   string
-	clientAEAD     atomic.Value
-	clientSeq      uint64
-	sessionCount   int64
-	lastActivity   int64
-	securityLock   sync.RWMutex
-	banList        = make(map[string]int64)
-	bufferPool     = sync.Pool{
-		New: func() interface{} { return make([]byte, 2048) },
-	}
-)
-
-// --- Crypto Helpers ---
-
 func sealPacket(dst []byte, aead cipher.AEAD, seq uint64, payload []byte) []byte {
-	nonce := dst[HDR_SIZE : HDR_SIZE+NONCE_SIZE]
-	binary.BigEndian.PutUint32(nonce[:4], 0xDEADBEEF) // Salt
+	nonce := dst[1:13]
+	binary.BigEndian.PutUint32(nonce[:4], 0xDEADBEEF)
 	binary.BigEndian.PutUint64(nonce[4:], seq)
-	return aead.Seal(dst[:HDR_SIZE+NONCE_SIZE], nonce, payload, nil)
+	return aead.Seal(dst[:13], nonce, payload, nil)
 }
 
 func openPacket(raw []byte, aead cipher.AEAD) ([]byte, uint64, error) {
 	if len(raw) < OVERHEAD {
 		return nil, 0, fmt.Errorf("short")
 	}
-	nonce := raw[HDR_SIZE : HDR_SIZE+NONCE_SIZE]
+	nonce := raw[1:13]
 	seq := binary.BigEndian.Uint64(nonce[4:])
-	out, err := aead.Open(nil, nonce, raw[HDR_SIZE+NONCE_SIZE:], nil)
+	out, err := aead.Open(nil, nonce, raw[13:], nil)
 	return out, seq, err
 }
 
-// --- System Network Config ---
+// --- Network Management ---
 
-func runCmd(c string, args ...string) { _ = exec.Command(c, args...).Run() }
-
-func configureSystem(name, localIP, peerIP string, isServer bool) (string, string) {
+func setupNetworking(name string, peerIP string, isServer bool) {
 	outFwd, _ := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
 	origForwarding = strings.TrimSpace(string(outFwd))
 
@@ -140,182 +149,184 @@ func configureSystem(name, localIP, peerIP string, isServer bool) (string, strin
 	}
 
 	runCmd("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU))
-	if localIP != "0.0.0.0" {
-		runCmd("ip", "addr", "replace", localIP+"/24", "dev", name)
-	}
 
 	if isServer {
+		runCmd("ip", "addr", "replace", "10.0.0.1/24", "dev", name)
 		runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
-		runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE")
-		runCmd("iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1260")
-		runCmd("iptables", "-A", "FORWARD", "-i", name, "-o", dev, "-j", "ACCEPT")
-		runCmd("iptables", "-A", "FORWARD", "-i", dev, "-o", name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-	} else if localIP != "0.0.0.0" && peerIP != "" {
-		runCmd("ip", "route", "add", peerIP, "via", gw, "dev", dev, "metric", "1")
-		_ = exec.Command("mv", "/etc/resolv.conf", "/etc/resolv.conf.bak").Run()
-		_ = exec.Command("bash", "-c", "echo 'nameserver 8.8.8.8' > /etc/resolv.conf").Run()
-
-		runCmd("iptables", "-N", "VPN_KILLSWITCH")
-		runCmd("iptables", "-I", "OUTPUT", "1", "-j", "VPN_KILLSWITCH")
-		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-o", "lo", "-j", "ACCEPT")
-		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-d", peerIP, "-p", "udp", "-j", "ACCEPT")
-		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-p", "udp", "--dport", "53", "-j", "ACCEPT")
-		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-o", name, "-j", "ACCEPT")
-		runCmd("iptables", "-A", "VPN_KILLSWITCH", "-j", "DROP")
-
-		runCmd("ip", "route", "add", "0.0.0.0/1", "dev", name, "metric", "5")
-		runCmd("ip", "route", "add", "128.0.0.0/1", "dev", name, "metric", "5")
+		runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
+		runCmd("iptables", "-A", "FORWARD", "-i", name, "-j", "ACCEPT")
+	} else if peerIP != "" {
+		runCmd("ip", "route", "add", peerIP, "via", gw, "dev", dev)
+		runCmd("iptables", "-N", "WOLF_VPN")
+		runCmd("iptables", "-I", "OUTPUT", "1", "-j", "WOLF_VPN")
+		runCmd("iptables", "-A", "WOLF_VPN", "-o", "lo", "-j", "ACCEPT")
+		runCmd("iptables", "-A", "WOLF_VPN", "-d", peerIP, "-p", "udp", "-j", "ACCEPT")
+		runCmd("iptables", "-A", "WOLF_VPN", "-o", name, "-j", "ACCEPT")
+		runCmd("iptables", "-A", "WOLF_VPN", "-j", "DROP")
+		runCmd("ip", "route", "add", "0.0.0.0/1", "dev", name)
+		runCmd("ip", "route", "add", "128.0.0.0/1", "dev", name)
 	}
-	return gw, dev
 }
 
-func cleanup(origFwd string, isServer bool) {
-	fmt.Println("\n[*] Cleaning up networking and security rules...")
-	securityLock.Lock()
-	for ip := range banList {
-		runCmd("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP")
-	}
-	securityLock.Unlock()
-
+func cleanup(isServer bool) {
 	if isServer {
-		runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "1")
-		runCmd("iptables", "-D", "FORWARD", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
 	} else {
-		runCmd("iptables", "-D", "OUTPUT", "-j", "VPN_KILLSWITCH")
-		runCmd("iptables", "-F", "VPN_KILLSWITCH")
-		runCmd("iptables", "-X", "VPN_KILLSWITCH")
-		if _, err := os.Stat("/etc/resolv.conf.bak"); err == nil {
-			_ = exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
-		}
+		runCmd("iptables", "-D", "OUTPUT", "-j", "WOLF_VPN")
+		runCmd("iptables", "-F", "WOLF_VPN")
+		runCmd("iptables", "-X", "WOLF_VPN")
 	}
-	runCmd("sysctl", "-w", "net.ipv4.ip_forward="+origFwd)
-	fmt.Println("[+] Cleanup complete. Exiting.")
+	runCmd("sysctl", "-w", "net.ipv4.ip_forward="+origForwarding)
 	os.Exit(0)
 }
 
-// --- Main Engine ---
+// --- Main ---
 
 func main() {
-	lPort := flag.String("l", "9000", "Port")
-	tAddrStr := flag.String("t", "", "Target")
-	pass := flag.String("p", "BatMan", "Secret")
-	tunIP := flag.String("ip", "10.0.0.1", "Internal IP")
+	lPort := flag.Int("l", 9000, "Local Port")
+	apiPort := flag.Int("api", 8080, "Web API Port")
+	tAddrStr := flag.String("t", "", "Target Host/IP")
+	pass := flag.String("p", "WolfPass", "Secret")
 	isServer := flag.Bool("server", false, "Server Mode")
 	flag.Parse()
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	tun, _ := water.New(water.Config{DeviceType: water.TUN})
 
-	pHost := ""
+	var currentTarget *net.UDPAddr
+	var targetHost string
 	if *tAddrStr != "" {
-		pHost, _, _ = net.SplitHostPort(*tAddrStr)
+		currentTarget, _ = net.ResolveUDPAddr("udp", *tAddrStr)
+		if currentTarget != nil {
+			targetHost = currentTarget.IP.String()
+		}
 	}
-	configureSystem(tun.Name(), *tunIP, pHost, *isServer)
+
+	setupNetworking(tun.Name(), targetHost, *isServer)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		cleanup(origForwarding, *isServer)
-	}()
+	go func() { <-sig; cleanup(*isServer) }()
 
-	lAddr, _ := net.ResolveUDPAddr("udp", ":"+*lPort)
+	lAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", *lPort))
 	conn, _ = net.ListenUDP("udp", lAddr)
 
-	target, _ := net.ResolveUDPAddr("udp", *tAddrStr)
-	host, _ := os.Hostname()
+	myPriv, myPub := generateKeys()
 
-	// Reaper for Server
 	if *isServer {
+		// --- The Reaper ---
 		go func() {
-			for range time.Tick(30 * time.Second) {
+			for range time.Tick(60 * time.Second) {
 				now := time.Now().Unix()
-				mgr.ByHWID.Range(func(k, v interface{}) bool {
-					s := v.(*UserSession)
+				mgr.ByIdentity.Range(func(key, value interface{}) bool {
+					s := value.(*UserSession)
 					if now-atomic.LoadInt64(&s.LastSeen) > SESSION_TTL {
-						mgr.ByHWID.Delete(k)
-						mgr.ByAddr.Delete(s.Addr.String())
+						fmt.Printf("[!] Reaper: Evicting %s (%s)\n", key.(string)[:8], s.InternalIP)
+						mgr.ByIdentity.Delete(key)
 						mgr.ByIP.Delete(s.InternalIP)
+						mgr.ByAddr.Delete(s.Addr.String())
 					}
 					return true
 				})
 			}
 		}()
+
+		// Dashboard
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, "<body style='background:#0f172a;color:white;font-family:sans-serif;padding:40px;'><h1>Wolf VPN</h1>")
+			mgr.ByIdentity.Range(func(k, v interface{}) bool {
+				s := v.(*UserSession)
+				fmt.Fprintf(w, "<p><b>ID:</b> %s | <b>IP:</b> %s | <b>Last Seen:</b> %ds ago</p>", k.(string)[:8], s.InternalIP, time.Now().Unix()-atomic.LoadInt64(&s.LastSeen))
+				return true
+			})
+			fmt.Fprintf(w, "</body><script>setTimeout(()=>location.reload(),5000)</script>")
+		})
+		go http.ListenAndServe(fmt.Sprintf(":%d", *apiPort), nil)
 	}
 
-	// 1. Inbound Workers: UDP -> TUN
+	// Worker Loop
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
 			for {
 				buf := bufferPool.Get().([]byte)
 				n, rem, err := conn.ReadFromUDP(buf)
 				if err != nil {
-					bufferPool.Put(buf)
 					continue
 				}
 
 				switch buf[0] {
 				case OP_DATA:
 					var aead cipher.AEAD
-					var session *UserSession
-					if *isServer {
-						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
-							session = val.(*UserSession)
-							aead = session.AEAD
-						}
-					} else {
+					var s *UserSession
+					if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+						s = val.(*UserSession)
+						aead = s.AEAD
+					} else if !*isServer {
 						if val := clientAEAD.Load(); val != nil {
 							aead = val.(cipher.AEAD)
 						}
 					}
-
 					if aead != nil {
 						plain, seq, err := openPacket(buf[:n], aead)
-						if err == nil {
-							if !*isServer || session.VerifySeq(seq) {
-								tun.Write(plain)
-								if *isServer {
-									atomic.StoreInt64(&session.LastSeen, time.Now().Unix())
-								} else {
-									atomic.StoreInt64(&lastActivity, time.Now().Unix())
-								}
+						if err == nil && (!*isServer || s.VerifySeq(seq)) {
+							tun.Write(plain)
+							if *isServer {
+								atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+							} else {
+								atomic.StoreInt64(&lastActivity, time.Now().Unix())
 							}
 						}
 					}
+
 				case OP_AUTH:
-					if *isServer {
-						hwid := string(buf[1:n])
-						var s *UserSession
-						if val, ok := mgr.ByHWID.Load(hwid); ok {
-							s = val.(*UserSession)
-							mgr.ByAddr.Delete(s.Addr.String())
-							s.Addr = rem
-						} else {
-							newIP := fmt.Sprintf("10.0.0.%d", 2+atomic.AddInt64(&sessionCount, 1)-1)
-							key := sha256.Sum256([]byte(*pass + newIP))
-							c, _ := chacha20poly1305.New(key[:])
-							s = &UserSession{Addr: rem, HWID: hwid, InternalIP: newIP, AEAD: c}
-							mgr.ByHWID.Store(hwid, s)
-							mgr.ByIP.Store(newIP, s)
+					if *isServer && n >= 65 {
+						clientPubRaw := buf[1:33]
+						if hmac.Equal(buf[33:65], signAuth([]byte(*pass), clientPubRaw)) {
+							id := hex.EncodeToString(clientPubRaw)
+							var s *UserSession
+							if val, ok := mgr.ByIdentity.Load(id); ok {
+								s = val.(*UserSession)
+								s.Addr = rem
+							} else {
+								// --- Smart IP Allocator ---
+								var assignedIP string
+								for i := 2; i < 255; i++ {
+									candidate := fmt.Sprintf("10.0.0.%d", i)
+									if _, occupied := mgr.ByIP.Load(candidate); !occupied {
+										assignedIP = candidate
+										break
+									}
+								}
+								if assignedIP != "" {
+									var cp [32]byte
+									copy(cp[:], clientPubRaw)
+									aead, _ := chacha20poly1305.New(deriveKey(myPriv, cp))
+									s = &UserSession{Addr: rem, InternalIP: assignedIP, AEAD: aead}
+									mgr.ByIdentity.Store(id, s)
+									mgr.ByIP.Store(assignedIP, s)
+								}
+							}
+							if s != nil {
+								mgr.ByAddr.Store(rem.String(), s)
+								atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+								resp := append([]byte{OP_AUTH}, myPub[:]...)
+								conn.WriteToUDP(append(resp, []byte(s.InternalIP)...), rem)
+							}
 						}
-						mgr.ByAddr.Store(rem.String(), s)
-						atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
-						conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(s.InternalIP)...), rem)
-					} else {
-						myAssignedIP = string(buf[1:n])
-						key := sha256.Sum256([]byte(*pass + myAssignedIP))
-						c, _ := chacha20poly1305.New(key[:])
-						clientAEAD.Store(c)
-						runCmd("ip", "addr", "replace", myAssignedIP+"/24", "dev", tun.Name())
+					} else if !*isServer {
+						var sp [32]byte
+						copy(sp[:], buf[1:33])
+						clientAEAD.Store(func() cipher.AEAD { a, _ := chacha20poly1305.New(deriveKey(myPriv, sp)); return a }())
+						assignedIP := string(buf[33:n])
+						runCmd("ip", "addr", "flush", "dev", tun.Name())
+						runCmd("ip", "addr", "add", assignedIP+"/24", "dev", tun.Name())
 						atomic.StoreInt64(&lastActivity, time.Now().Unix())
 					}
+
 				case OP_KEEPALIVE:
-					if *isServer {
-						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
-							atomic.StoreInt64(&val.(*UserSession).LastSeen, time.Now().Unix())
-						}
-					} else {
-						atomic.StoreInt64(&lastActivity, time.Now().Unix())
+					if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+						atomic.StoreInt64(&val.(*UserSession).LastSeen, time.Now().Unix())
 					}
 				}
 				bufferPool.Put(buf)
@@ -323,42 +334,42 @@ func main() {
 		}()
 	}
 
-	// 2. Heartbeat
+	// Client Loop (DDNS + Handshake)
 	go func() {
 		for range time.Tick(10 * time.Second) {
 			if !*isServer && *tAddrStr != "" {
-				if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 30 || myAssignedIP == "" {
-					conn.WriteToUDP(append([]byte{OP_AUTH}, []byte(host)...), target)
+				if addr, err := net.ResolveUDPAddr("udp", *tAddrStr); err == nil {
+					currentTarget = addr
+				}
+				if currentTarget == nil {
+					continue
+				}
+				if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 20 {
+					req := append([]byte{OP_AUTH}, myPub[:]...)
+					conn.WriteToUDP(append(req, signAuth([]byte(*pass), myPub[:])...), currentTarget)
 				} else {
-					conn.WriteToUDP([]byte{OP_KEEPALIVE}, target)
+					conn.WriteToUDP([]byte{OP_KEEPALIVE}, currentTarget)
 				}
 			}
 		}
 	}()
 
-	// 3. Outbound Loop: TUN -> UDP
+	// Outbound Tunnel
 	for {
-		pkt := bufferPool.Get().([]byte)
-		n, err := tun.Read(pkt)
-		if err != nil {
-			bufferPool.Put(pkt)
-			continue
-		}
-
-		txBuf := bufferPool.Get().([]byte)
-		txBuf[0] = OP_DATA
-		if *isServer {
-			if n >= 20 {
-				destIP := net.IP(pkt[16:20]).String()
-				if val, ok := mgr.ByIP.Load(destIP); ok {
-					u := val.(*UserSession)
-					conn.WriteToUDP(sealPacket(txBuf, u.AEAD, atomic.AddUint64(&u.SeqOut, 1), pkt[:n]), u.Addr)
-				}
+		pkt := make([]byte, 2048)
+		n, _ := tun.Read(pkt)
+		tx := make([]byte, 2048)
+		tx[0] = OP_DATA
+		if *isServer && n >= 20 {
+			destIP := net.IP(pkt[16:20]).String()
+			if val, ok := mgr.ByIP.Load(destIP); ok {
+				s := val.(*UserSession)
+				conn.WriteToUDP(sealPacket(tx, s.AEAD, atomic.AddUint64(&s.SeqOut, 1), pkt[:n]), s.Addr)
 			}
-		} else if val := clientAEAD.Load(); val != nil {
-			conn.WriteToUDP(sealPacket(txBuf, val.(cipher.AEAD), atomic.AddUint64(&clientSeq, 1), pkt[:n]), target)
+		} else if !*isServer {
+			if val := clientAEAD.Load(); val != nil && currentTarget != nil {
+				conn.WriteToUDP(sealPacket(tx, val.(cipher.AEAD), atomic.AddUint64(&clientSeq, 1), pkt[:n]), currentTarget)
+			}
 		}
-		bufferPool.Put(pkt)
-		bufferPool.Put(txBuf)
 	}
 }
