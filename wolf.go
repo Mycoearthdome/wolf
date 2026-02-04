@@ -215,7 +215,7 @@ func main() {
 	lPort := flag.Int("l", 9000, "Local Port")
 	apiPort := flag.Int("api", 8080, "Web API Port")
 	tAddrStr := flag.String("t", "", "Target Host/IP")
-	pass := flag.String("p", "WolfPass", "Secret")
+	pass := flag.String("p", "BatMan", "Secret")
 	isServer := flag.Bool("server", false, "Server Mode")
 	flag.Parse()
 
@@ -270,6 +270,32 @@ func main() {
 					trafficHistory = trafficHistory[len(trafficHistory)-60:]
 				}
 				historyMu.Unlock()
+			}
+		}()
+
+		// --- Session Reaper ---
+		go func() {
+			// Check every 30 seconds for ghost sessions
+			for range time.Tick(30 * time.Second) {
+				now := time.Now().Unix()
+				reapedCount := 0
+
+				mgr.ByIdentity.Range(func(k, v interface{}) bool {
+					s := v.(*UserSession)
+					// If no activity for 2 minutes, purge the session
+					if now-atomic.LoadInt64(&s.LastSeen) > 120 {
+						id := k.(string)
+						mgr.ByIdentity.Delete(id)
+						mgr.ByAddr.Delete(s.Addr.String())
+						mgr.ByIP.Delete(s.InternalIP)
+						reapedCount++
+					}
+					return true
+				})
+
+				if reapedCount > 0 {
+					fmt.Printf("[SYS] REAPER: %d stale sessions purged from registry\n", reapedCount)
+				}
 			}
 		}()
 
@@ -385,47 +411,80 @@ func main() {
 					if *isServer && n >= 65 {
 						clientPubRaw := buf[1:33]
 						if hmac.Equal(buf[33:65], signAuth([]byte(*pass), clientPubRaw)) {
-							// Trigger Geo lookup in background
-							go updateGeoInfo(rem.IP.String())
-
 							id := hex.EncodeToString(clientPubRaw)
-							var s *UserSession
+
+							// 1. RE-AUTH LOGIC: Check if we already know this user identity
 							if val, ok := mgr.ByIdentity.Load(id); ok {
-								s = val.(*UserSession)
-								s.Addr = rem
-							} else {
-								assignedIP := ""
-								for i := 2; i < 255; i++ {
-									ip := fmt.Sprintf("10.0.0.%d", i)
-									if _, occupied := mgr.ByIP.Load(ip); !occupied {
-										assignedIP = ip
-										break
-									}
+								s := val.(*UserSession)
+
+								// If the physical UDP address changed (roaming), purge the old mapping
+								if s.Addr.String() != rem.String() {
+									mgr.ByAddr.Delete(s.Addr.String())
+									s.Addr = rem
 								}
-								if assignedIP != "" {
-									var cp [32]byte
-									copy(cp[:], clientPubRaw)
-									aead, _ := chacha20poly1305.New(deriveKey(myPriv, cp))
-									s = &UserSession{Addr: rem, InternalIP: assignedIP, AEAD: aead}
-									mgr.ByIdentity.Store(id, s)
-									mgr.ByIP.Store(assignedIP, s)
-								}
-							}
-							if s != nil {
+
 								mgr.ByAddr.Store(rem.String(), s)
 								atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+
+								// Send ACK back to client with their existing Internal IP
 								resp := append([]byte{OP_AUTH}, myPub[:]...)
 								conn.WriteToUDP(append(resp, []byte(s.InternalIP)...), rem)
+								continue
+							}
+
+							// 2. NEW SESSION ALLOCATION
+							assignedIP := ""
+							for i := 2; i < 255; i++ {
+								ip := fmt.Sprintf("10.0.0.%d", i)
+								if _, occupied := mgr.ByIP.Load(ip); !occupied {
+									assignedIP = ip
+									break
+								}
+							}
+
+							if assignedIP != "" {
+								var cp [32]byte
+								copy(cp[:], clientPubRaw)
+								// Create security context
+								aead, _ := chacha20poly1305.New(deriveKey(myPriv, cp))
+
+								s := &UserSession{
+									Addr:       rem,
+									InternalIP: assignedIP,
+									AEAD:       aead,
+									LastSeen:   time.Now().Unix(),
+								}
+
+								// Store in all registries
+								mgr.ByIdentity.Store(id, s)
+								mgr.ByIP.Store(assignedIP, s)
+								mgr.ByAddr.Store(rem.String(), s)
+
+								go updateGeoInfo(rem.IP.String())
+
+								// Send Handshake ACK
+								resp := append([]byte{OP_AUTH}, myPub[:]...)
+								conn.WriteToUDP(append(resp, []byte(s.InternalIP)...), rem)
+								fmt.Printf("[AUTH] New Node: %s assigned to %s\n", id[:8], assignedIP)
 							}
 						}
 					} else if !*isServer && n >= 33 {
+						// --- CLIENT SIDE HANDSHAKE ACK ---
+						// The server has verified our key and sent back its public key + our assigned IP
 						var sp [32]byte
 						copy(sp[:], buf[1:33])
-						clientAEAD.Store(func() cipher.AEAD { a, _ := chacha20poly1305.New(deriveKey(myPriv, sp)); return a }())
-						assignedIP := string(buf[33:n])
 
+						// Initialize local encryption
+						aead, _ := chacha20poly1305.New(deriveKey(myPriv, sp))
+						clientAEAD.Store(aead)
+
+						assignedIP := string(buf[33:n])
+						fmt.Printf("[SYS] Handshake Successful. Assigned IP: %s\n", assignedIP)
+
+						// Apply the IP to the local TUN interface
 						runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
 
+						// Set up standard split-tunnel routing
 						out, _ := exec.Command("ip", "route", "show", "default").Output()
 						fields := strings.Fields(string(out))
 						var gateway string
@@ -435,9 +494,13 @@ func main() {
 								break
 							}
 						}
+
 						if currentTarget != nil && gateway != "" {
+							// Ensure traffic to the server itself goes over the physical line, not the tunnel
 							runCmd("ip", "route", "add", currentTarget.IP.String(), "via", gateway)
 						}
+
+						// Route everything else through the tunnel
 						runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
 						runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
 
