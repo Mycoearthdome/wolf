@@ -69,6 +69,12 @@ type PeerStat struct {
 	Status string `json:"status"`
 }
 
+type GeoData struct {
+	City    string `json:"city"`
+	Country string `json:"countryCode"`
+	Flag    string `json:"flag"` // emoji flag
+}
+
 var (
 	startTime      = time.Now()
 	mgr            = &SessionManager{}
@@ -81,6 +87,8 @@ var (
 	historyMu      sync.RWMutex
 	trafficHistory = make([]uint64, 60)
 	bufferPool     = sync.Pool{New: func() interface{} { return make([]byte, 2048) }}
+	banMap         sync.Map // IP string -> int64 (expiry timestamp)
+	geoCache       sync.Map // IP string -> GeoData
 )
 
 // --- Helpers ---
@@ -242,6 +250,7 @@ func main() {
 		trafficHistory = make([]uint64, 60)
 		historyMu.Unlock()
 
+		// Stats Engine: Run once per second to calculate deltas
 		go func() {
 			var lastTotal uint64
 			ticker := time.NewTicker(1 * time.Second)
@@ -264,23 +273,44 @@ func main() {
 			}
 		}()
 
+		// API Endpoint
 		http.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-			peers := []PeerStat{}
+			peers := []interface{}{}
+			now := time.Now().Unix()
+
 			mgr.ByIdentity.Range(func(k, v interface{}) bool {
 				s := v.(*UserSession)
 				ls := atomic.LoadInt64(&s.LastSeen)
+
+				// Calculate health status based on LastSeen
+				diff := now - ls
 				status := "STABLE"
-				if time.Now().Unix()-ls > 20 {
+				if diff > 30 {
+					status = "GHOST"
+				} else if diff > 10 {
 					status = "LAGGING"
 				}
 
-				peers = append(peers, PeerStat{
-					ID:     k.(string)[:8],
-					IP:     s.InternalIP,
-					TX:     formatBytes(atomic.LoadUint64(&s.BytesOut)),
-					RX:     formatBytes(atomic.LoadUint64(&s.BytesIn)),
-					LT:     time.Now().Unix() - ls,
-					Status: status,
+				extIP := strings.Split(s.Addr.String(), ":")[0]
+
+				// Safety check for GeoCache to prevent nil pointer panics
+				city, flag := "Unknown", "🌐"
+				if geo, ok := geoCache.Load(extIP); ok {
+					gData := geo.(GeoData)
+					city = gData.City
+					flag = gData.Flag
+				}
+
+				peers = append(peers, map[string]interface{}{
+					"id":        k.(string)[:8],
+					"ip":        s.InternalIP,
+					"ext_ip":    extIP,
+					"tx":        formatBytes(atomic.LoadUint64(&s.BytesOut)),
+					"rx":        formatBytes(atomic.LoadUint64(&s.BytesIn)),
+					"city":      city,
+					"flag":      flag,
+					"status":    status,
+					"last_seen": diff, // Seconds since last contact
 				})
 				return true
 			})
@@ -297,7 +327,6 @@ func main() {
 				"peers": peers,
 				"hist":  histCopy,
 				"up":    time.Since(startTime).Truncate(time.Second).String(),
-				"gr":    runtime.NumGoroutine(),
 			})
 		})
 
@@ -307,7 +336,7 @@ func main() {
 			fmt.Fprint(w, dashboardHTML)
 		})
 
-		fmt.Printf("[WEB] Dashboard active on :%d\n", *apiPort)
+		fmt.Printf("[WEB] Cyber-Dashboard active on :%d\n", *apiPort)
 		go http.ListenAndServe(fmt.Sprintf(":%d", *apiPort), nil)
 	}
 
@@ -319,6 +348,15 @@ func main() {
 				n, rem, err := conn.ReadFromUDP(buf)
 				if err != nil {
 					continue
+				}
+
+				// --- BAN CHECK ---
+				if expiry, banned := banMap.Load(rem.IP.String()); banned {
+					if time.Now().Unix() < expiry.(int64) {
+						bufferPool.Put(buf)
+						continue
+					}
+					banMap.Delete(rem.IP.String())
 				}
 
 				switch buf[0] {
@@ -347,6 +385,9 @@ func main() {
 					if *isServer && n >= 65 {
 						clientPubRaw := buf[1:33]
 						if hmac.Equal(buf[33:65], signAuth([]byte(*pass), clientPubRaw)) {
+							// Trigger Geo lookup in background
+							go updateGeoInfo(rem.IP.String())
+
 							id := hex.EncodeToString(clientPubRaw)
 							var s *UserSession
 							if val, ok := mgr.ByIdentity.Load(id); ok {
@@ -375,7 +416,6 @@ func main() {
 								atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
 								resp := append([]byte{OP_AUTH}, myPub[:]...)
 								conn.WriteToUDP(append(resp, []byte(s.InternalIP)...), rem)
-								fmt.Printf("[AUTH] Peer %s @ %s\n", id[:8], s.InternalIP)
 							}
 						}
 					} else if !*isServer && n >= 33 {
@@ -384,10 +424,8 @@ func main() {
 						clientAEAD.Store(func() cipher.AEAD { a, _ := chacha20poly1305.New(deriveKey(myPriv, sp)); return a }())
 						assignedIP := string(buf[33:n])
 
-						fmt.Println("[AUTH] Handshake success. Configuring tunnel...")
 						runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
 
-						// --- FIX: PIN SERVER IP TO PHYSICAL GATEWAY ---
 						out, _ := exec.Command("ip", "route", "show", "default").Output()
 						fields := strings.Fields(string(out))
 						var gateway string
@@ -398,24 +436,12 @@ func main() {
 							}
 						}
 						if currentTarget != nil && gateway != "" {
-							serverIP := currentTarget.IP.String()
-							runCmd("ip", "route", "add", serverIP, "via", gateway)
-							fmt.Printf("[SYS] Pinned server %s via physical gateway %s\n", serverIP, gateway)
+							runCmd("ip", "route", "add", currentTarget.IP.String(), "via", gateway)
 						}
-
-						// --- REDIRECT ALL TRAFFIC ---
 						runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
 						runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
 
-						// --- DNS PROTECTION ---
-						runCmd("resolvectl", "dns", tun.Name(), "8.8.8.8")
-						runCmd("resolvectl", "domain", tun.Name(), "~.")
-
 						atomic.StoreInt64(&lastActivity, time.Now().Unix())
-					}
-				case OP_KEEPALIVE:
-					if val, ok := mgr.ByAddr.Load(rem.String()); ok {
-						atomic.StoreInt64(&val.(*UserSession).LastSeen, time.Now().Unix())
 					}
 				}
 				bufferPool.Put(buf)
@@ -453,10 +479,8 @@ func main() {
 				tx[0] = OP_DATA
 				encrypted := sealPacket(tx, s.AEAD, atomic.AddUint64(&s.SeqOut, 1), pkt[:n])
 				conn.WriteToUDP(encrypted, s.Addr)
-
-				sent := uint64(len(encrypted))
-				atomic.AddUint64(&s.BytesOut, sent)
-				atomic.AddUint64(&totalBytes, sent)
+				atomic.AddUint64(&s.BytesOut, uint64(len(encrypted)))
+				atomic.AddUint64(&totalBytes, uint64(len(encrypted)))
 			}
 		} else if !*isServer {
 			if val := clientAEAD.Load(); val != nil && currentTarget != nil {
@@ -478,73 +502,155 @@ const dashboardHTML = `
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
-        body { background: #020408; color: #94a3b8; font-family: 'JetBrains Mono', monospace; }
-        .panel { background: #0f172a; border: 1px solid #1e293b; }
-        .chart-box { position: relative; height: 180px; width: 100%; }
-        .btn-sys { padding: 4px 12px; border-radius: 4px; font-size: 10px; font-weight: bold; text-transform: uppercase; border: 1px solid transparent; cursor: pointer; }
-        .btn-danger { color: #ef4444; border-color: #450a0a; background: #1a0505; }
-        .btn-primary { color: #3b82f6; border-color: #1e3a8a; background: #0f172a; }
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=JetBrains+Mono&display=swap');
+        
+        :root {
+            --neon-cyan: #00f2ff;
+            --neon-pink: #ff0055;
+            --void-bg: #020408;
+        }
+
+        body { 
+            background: radial-gradient(circle at center, #0a0f1d 0%, var(--void-bg) 100%);
+            color: #94a3b8; 
+            font-family: 'JetBrains Mono', monospace; 
+            overflow-x: hidden;
+        }
+
+        .cyber-panel { 
+            background: rgba(15, 23, 42, 0.7); 
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(0, 242, 255, 0.2);
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+            position: relative;
+        }
+
+        .cyber-panel::before {
+            content: "";
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), 
+                        linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 2px, 3px 100%;
+            pointer-events: none;
+        }
+
+        h1, h2 { font-family: 'Orbitron', sans-serif; text-transform: uppercase; letter-spacing: 2px; }
+        
+        .glow-text { text-shadow: 0 0 10px var(--neon-cyan); color: white; }
+        .glow-pink { text-shadow: 0 0 10px var(--neon-pink); color: var(--neon-pink); }
+
+        .btn-cyber {
+            font-size: 10px;
+            font-weight: bold;
+            padding: 5px 15px;
+            border: 1px solid;
+            transition: all 0.3s ease;
+            clip-path: polygon(10% 0, 100% 0, 100% 70%, 90% 100%, 0 100%, 0 30%);
+        }
+
+        .btn-cyan { border-color: var(--neon-cyan); color: var(--neon-cyan); }
+        .btn-cyan:hover { background: var(--neon-cyan); color: black; box-shadow: 0 0 20px var(--neon-cyan); }
+        
+        .btn-ban { border-color: var(--neon-pink); color: var(--neon-pink); }
+        .btn-ban:hover { background: var(--neon-pink); color: white; box-shadow: 0 0 20px var(--neon-pink); }
+
+        .scanline {
+            width: 100%; height: 2px; background: rgba(0, 242, 255, 0.1);
+            position: fixed; top: 0; z-index: 999; pointer-events: none;
+            animation: scan 8s linear infinite;
+        }
+
+        @keyframes scan { from { top: 0; } to { top: 100vh; } }
     </style>
 </head>
-<body class="p-4">
+<body class="p-6">
+    <div class="scanline"></div>
     <div class="max-w-7xl mx-auto">
-        <div class="flex justify-between items-center mb-6 bg-slate-900/50 p-4 border border-slate-800 rounded-lg">
-            <h1 class="text-white font-black italic text-xl">WOLF_SYSOP</h1>
-            <div class="flex gap-2">
-                <button onclick="adminAction('reset_stats')" class="btn-sys btn-primary">Reset Stats</button>
-                <button onclick="adminAction('shutdown')" class="btn-sys btn-danger">Shutdown</button>
+        <div class="flex justify-between items-center mb-8 p-6 cyber-panel border-l-4 border-l-[#00f2ff]">
+            <div>
+                <h1 class="text-3xl font-black italic glow-text">WOLF_SYSOP <span class="text-xs font-normal opacity-50">v3.0.4</span></h1>
+                <p class="text-[10px] text-cyan-400 opacity-70 mt-1">STATUS: ENCRYPTED_TUNNEL_ACTIVE // UPTIME: <span id="stat-up">--:--:--</span></p>
+            </div>
+            <div class="flex gap-3">
+                <button onclick="adminAction('reset_stats')" class="btn-cyber btn-cyan">PURGE_STATS</button>
+                <button onclick="adminAction('shutdown')" class="btn-cyber btn-ban">TERMINATE_DAEMON</button>
             </div>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
             <div class="lg:col-span-3 space-y-6">
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div class="panel p-4 rounded-lg">
-                        <div class="text-[9px] uppercase mb-1">Total Traffic</div>
-                        <div class="text-xl text-white font-bold" id="stat-total">0 B</div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="cyber-panel p-4">
+                        <div class="text-[9px] uppercase text-cyan-500 mb-1 tracking-widest">Aggregate Traffic</div>
+                        <div class="text-2xl font-bold glow-text" id="stat-total">0 B</div>
                     </div>
-                    <div class="panel p-4 rounded-lg border-l-2 border-l-blue-500">
-                        <div class="text-[9px] uppercase mb-1">Current Speed</div>
-                        <div class="text-xl text-white font-bold" id="stat-bps">0 B/s</div>
+                    <div class="cyber-panel p-4 border-l-2 border-l-[#ff0055]">
+                        <div class="text-[9px] uppercase text-[#ff0055] mb-1 tracking-widest">Active Nodes</div>
+                        <div class="text-2xl font-bold text-white" id="stat-count">0</div>
+                    </div>
+                    <div class="cyber-panel p-4">
+                        <div class="text-[9px] uppercase text-cyan-500 mb-1 tracking-widest">Current Waveform</div>
+                        <div class="text-2xl font-bold glow-text" id="stat-bps">0 B/s</div>
                     </div>
                 </div>
 
-                <div class="panel p-6 rounded-xl">
-                    <canvas id="trafficChart"></canvas>
+                <div class="cyber-panel p-6">
+                    <h2 class="text-xs mb-4 opacity-80">Traffic_Monitor_Stream</h2>
+                    <div style="height: 200px;">
+                        <canvas id="trafficChart"></canvas>
+                    </div>
                 </div>
 
-                <div class="panel rounded-xl overflow-hidden">
+                <div class="cyber-panel overflow-hidden">
                     <table class="w-full text-left text-xs">
-                        <thead class="bg-slate-800/40 text-slate-500 uppercase">
+                        <thead class="bg-cyan-950/30 text-cyan-400 uppercase font-bold border-b border-cyan-900/50">
                             <tr>
                                 <th class="p-4">Identity</th>
-                                <th class="p-4">IP</th>
-                                <th class="p-4">Stats</th>
-                                <th class="p-4 text-right">Action</th>
+                                <th class="p-4">Virtual_IP</th>
+                                <th class="p-4">Origin_Source</th>
+                                <th class="p-4">Payload_Stats</th>
+                                <th class="p-4 text-right">Sanction</th>
                             </tr>
                         </thead>
-                        <tbody id="peer-list"></tbody>
+                        <tbody id="peer-list" class="divide-y divide-cyan-900/20"></tbody>
                     </table>
                 </div>
             </div>
             
-            <div class="panel rounded-xl p-4 text-[10px] font-mono h-[400px] overflow-y-auto" id="log-container">
-                <div class="text-slate-600 italic">SYSTEM READY...</div>
+            <div class="cyber-panel p-4 flex flex-col h-[600px]">
+                <h2 class="text-[10px] glow-pink mb-4 italic tracking-tighter">>> SYSTEM_LOG_OUTPUT</h2>
+                <div class="flex-1 overflow-y-auto font-mono text-[10px] space-y-1" id="log-container">
+                    <div class="text-cyan-800">[00.00.00] INITIALIZING_CORE...</div>
+                </div>
             </div>
         </div>
     </div>
 
     <script>
-        // Use standard string concatenation to avoid backtick issues in some Go versions
+        const logContainer = document.getElementById('log-container');
+        function addLog(msg, color) {
+            if (!color) color = 'text-cyan-600';
+            const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+            const div = document.createElement('div');
+            div.className = color;
+            div.innerHTML = '[' + time + '] ' + msg;
+            logContainer.prepend(div);
+            if(logContainer.children.length > 50) logContainer.lastChild.remove();
+        }
+
         async function update() {
             try {
                 const r = await fetch("/api/stats");
                 const d = await r.json();
                 
                 document.getElementById("stat-total").innerText = d.total;
+                document.getElementById("stat-count").innerText = d.count;
+                document.getElementById("stat-up").innerText = d.up;
+
                 if (d.hist && d.hist.length > 0) {
-                    document.getElementById("stat-bps").innerText = formatBytes(d.hist[d.hist.length-1]) + "/s";
+                    const currentSpeed = d.hist[d.hist.length-1];
+                    document.getElementById("stat-bps").innerText = formatBytes(currentSpeed) + "/s";
                     chart.data.datasets[0].data = d.hist;
                     chart.update('none');
                 }
@@ -553,11 +659,34 @@ const dashboardHTML = `
                 tbody.innerHTML = "";
                 (d.peers || []).forEach(p => {
                     const row = document.createElement("tr");
-                    row.className = "border-b border-slate-800/30";
-                    row.innerHTML = '<td class="p-4 text-white font-bold">' + p.id + '</td>' +
-                                  '<td class="p-4 text-blue-400">' + p.ip + '</td>' +
-                                  '<td class="p-4">TX ' + p.tx + ' / RX ' + p.rx + '</td>' +
-                                  '<td class="p-4 text-right"><button onclick="adminAction(\'kick\', \'' + p.id + '\')" class="btn-sys btn-danger">Kick</button></td>';
+                    row.className = "hover:bg-cyan-400/5 transition-colors";
+                    
+                    const statusClass = p.status === 'STABLE' ? 'text-cyan-400' : 'text-red-500 animate-pulse';
+                    const lastSeenText = p.last_seen + 's ago';
+
+                    row.innerHTML = 
+                        '<td class="p-4">' +
+                            '<div class="text-white font-bold tracking-widest">' + p.id + '</div>' +
+                            '<div class="text-[9px] ' + statusClass + ' font-bold uppercase">' + p.status + ' (' + lastSeenText + ')</div>' +
+                        '</td>' +
+                        '<td class="p-4 text-cyan-400 font-bold">' + p.ip + '</td>' +
+                        '<td class="p-4">' +
+                            '<div class="flex items-center gap-2">' +
+                                '<span class="text-lg">' + (p.flag || '🌐') + '</span>' +
+                                '<div>' + 
+                                    '<div class="text-white">' + p.ext_ip + '</div>' +
+                                    '<div class="text-[9px] opacity-60">' + (p.city || 'Unknown_Sector') + '</div>' +
+                                '</div>' +
+                            '</div>' +
+                        '</td>' +
+                        '<td class="p-4 opacity-80">' +
+                            'TX: <span class="text-cyan-400">' + p.tx + '</span><br>' +
+                            'RX: <span class="text-pink-400">' + p.rx + '</span>' +
+                        '</td>' +
+                        '<td class="p-4 text-right space-x-2">' +
+                            '<button onclick="adminAction(\'kick\', \'' + p.id + '\')" class="btn-cyber border-cyan-700 text-cyan-700 hover:text-cyan-300">KICK</button>' +
+                            '<button onclick="adminAction(\'ban\', \'' + p.ext_ip + '\')" class="btn-cyber btn-ban">BANISH</button>' +
+                        '</td>';
                     tbody.appendChild(row);
                 });
             } catch(e) { console.error(e); }
@@ -569,21 +698,51 @@ const dashboardHTML = `
             return (b / Math.pow(1024, i)).toFixed(1) + ' ' + ['B', 'KB', 'MB', 'GB'][i];
         }
 
-        const chart = new Chart(document.getElementById("trafficChart"), {
+        const ctx = document.getElementById("trafficChart").getContext('2d');
+        const gradient = ctx.createLinearGradient(0, 0, 0, 200);
+        gradient.addColorStop(0, 'rgba(0, 242, 255, 0.3)');
+        gradient.addColorStop(1, 'rgba(0, 242, 255, 0)');
+
+        const chart = new Chart(ctx, {
             type: "line",
             data: {
-                labels: Array(60).fill(""),
-                datasets: [{ data: Array(60).fill(0), borderColor: "#3b82f6", tension: 0.3, fill: true }]
+                // Fix: Removed Go variable reference 'trafficHistory'
+                labels: Array(60).fill(""), 
+                datasets: [{ 
+                    data: Array(60).fill(0), 
+                    borderColor: "#00f2ff", 
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.4, 
+                    fill: true,
+                    backgroundColor: gradient
+                }]
             },
-            options: { scales: { x: { display: false }, y: { beginAtZero: true } }, plugins: { legend: false } }
+            options: { 
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: { 
+                    x: { display: false }, 
+                    y: { 
+                        beginAtZero: true,
+                        grid: { color: 'rgba(0, 242, 255, 0.05)' },
+                        ticks: { font: { size: 9 }, color: '#444' }
+                    } 
+                }, 
+                plugins: { legend: false } 
+            }
         });
 
-        async function adminAction(a, t="") {
-            await fetch("/api/admin?action=" + a + "&target=" + t);
-            update();
+        async function adminAction(a, t) {
+            if (!t) t = "";
+            addLog('EXECUTING_PROTOCOL: ' + a.toUpperCase() + ' -> ' + t, a === 'ban' ? 'text-pink-500' : 'text-cyan-400');
+            await fetch('/api/admin?action=' + a + '&target=' + t);
+            setTimeout(update, 500);
         }
 
         setInterval(update, 1000);
+        addLog("VOICE_INTERFACE_READY", "text-cyan-400");
+        addLog("NEURAL_LINK_ESTABLISHED", "text-cyan-400");
     </script>
 </body>
 </html>
@@ -594,37 +753,63 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("target")
 
 	switch action {
-	case "kick":
-		// Iterate through sessions to find the one matching the prefix
+	case "ban":
+		banMap.Store(target, time.Now().Add(1*time.Hour).Unix())
+		// Iterate through sessions to find the one matching this external IP
 		mgr.ByIdentity.Range(func(k, v interface{}) bool {
-			if strings.HasPrefix(k.(string), target) {
-				s := v.(*UserSession)
-				// Remove from all lookup maps
+			s := v.(*UserSession)
+			if strings.HasPrefix(s.Addr.String(), target) {
 				mgr.ByIdentity.Delete(k)
 				mgr.ByAddr.Delete(s.Addr.String())
 				mgr.ByIP.Delete(s.InternalIP)
-				fmt.Printf("[ADMIN] Kicked peer: %s\n", k.(string)[:8])
-				return false // Stop iterating
 			}
 			return true
 		})
+		fmt.Printf("[BANISH] %s exiled\n", target)
 
-	case "reset_stats":
-		// Reset global counter
-		atomic.StoreUint64(&totalBytes, 0)
-		// Reset individual peer counters
+	case "kick":
+		// Kick uses the Identity ID (first 8 chars or full)
 		mgr.ByIdentity.Range(func(k, v interface{}) bool {
-			s := v.(*UserSession)
-			atomic.StoreUint64(&s.BytesIn, 0)
-			atomic.StoreUint64(&s.BytesOut, 0)
+			id := k.(string)
+			if strings.HasPrefix(id, target) {
+				s := v.(*UserSession)
+				mgr.ByIdentity.Delete(k)
+				mgr.ByAddr.Delete(s.Addr.String())
+				mgr.ByIP.Delete(s.InternalIP)
+				return false
+			}
 			return true
 		})
-		fmt.Println("[ADMIN] Statistics have been reset")
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
-	case "shutdown":
-		fmt.Println("[ADMIN] Remote shutdown initiated")
-		cleanup(true) // This calls your existing cleanup logic
+func updateGeoInfo(ip string) {
+	if _, exists := geoCache.Load(ip); exists {
+		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Using a 2-second timeout to prevent handshake lag
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode,city", ip))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		Status  string `json:"status"`
+		Country string `json:"countryCode"`
+		City    string `json:"city"`
+	}
+	json.NewDecoder(resp.Body).Decode(&res)
+
+	if res.Status == "success" {
+		flagEmoji := ""
+		if len(res.Country) == 2 {
+			// Convert country code to regional indicator symbols
+			flagEmoji = string(rune(res.Country[0])+127397) + string(rune(res.Country[1])+127397)
+		}
+		geoCache.Store(ip, GeoData{City: res.City, Country: res.Country, Flag: flagEmoji})
+	}
 }
