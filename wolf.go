@@ -780,6 +780,24 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			return true
 		})
+
+	case "reset_stats":
+		// Reset the global counter
+		atomic.StoreUint64(&totalBytes, 0)
+
+		// Wipe the traffic history chart data
+		historyMu.Lock()
+		trafficHistory = make([]uint64, 60)
+		historyMu.Unlock()
+
+		// Optionally reset individual peer counters
+		mgr.ByIdentity.Range(func(k, v interface{}) bool {
+			s := v.(*UserSession)
+			atomic.StoreUint64(&s.BytesIn, 0)
+			atomic.StoreUint64(&s.BytesOut, 0)
+			return true
+		})
+		fmt.Println("[SYS] Traffic statistics purged by administrator")
 	}
 	w.WriteHeader(http.StatusOK)
 }
