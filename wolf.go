@@ -658,45 +658,56 @@ const dashboardHTML = `
         @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=JetBrains+Mono&display=swap');
         :root { --cyan: #00f2ff; --pink: #ff0055; --bg: #020408; }
         body { background: var(--bg); color: #94a3b8; font-family: 'JetBrains Mono', monospace; overflow: hidden; margin: 0; height: 100vh; }
-        #world-map { position: fixed; inset: 0; opacity: 0.15; z-index: 0; }
+        
+        /* Map Container */
+        #world-map { position: fixed; inset: 0; opacity: 0.4; z-index: 0; background: #000; pointer-events: none; }
+        #world-map svg { width: 100%; height: 100%; }
+
+        /* UI State Transitions */
+        .ui-visible { opacity: 1; transition: opacity 0.5s ease, visibility 0.5s; }
+        .ui-hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+
         .panel { background: rgba(10, 15, 28, 0.9); backdrop-filter: blur(10px); border: 1px solid rgba(0, 242, 255, 0.1); }
         .glow { text-shadow: 0 0 10px var(--cyan); color: white; font-family: 'Orbitron'; }
         .lockdown-ui { border-color: var(--pink) !important; background: rgba(30, 0, 0, 0.9) !important; }
+        
         .btn { font-size: 10px; padding: 5px 15px; border: 1px solid var(--cyan); color: var(--cyan); cursor: pointer; text-transform: uppercase; clip-path: polygon(10% 0, 100% 0, 100% 70%, 90% 100%, 0 100%, 0 30%); transition: all 0.2s; }
         .btn:hover { background: var(--cyan); color: #000; box-shadow: 0 0 15px var(--cyan); }
         .btn-red { border-color: var(--pink); color: var(--pink); }
         .btn-red:hover { background: var(--pink); color: #fff; box-shadow: 0 0 15px var(--pink); }
         
-        /* Modal Styles */
+        #hud-toggle { position: fixed; bottom: 20px; right: 20px; z-index: 100; opacity: 0.5; }
+        #hud-toggle:hover { opacity: 1; }
+
         .modal-content { background: #05070a; border: 1px solid var(--cyan); box-shadow: 0 0 50px rgba(0, 242, 255, 0.1); }
-        textarea::-webkit-scrollbar { width: 6px; }
-        textarea::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
     </style>
 </head>
 <body>
     <div id="world-map"></div>
 
+    <button id="hud-toggle" onclick="toggleUI()" class="btn">Interface_Toggle [H]</button>
+
     <div id="log-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-6">
         <div class="modal-content w-full max-w-4xl h-[80vh] flex flex-col p-6 overflow-hidden">
             <div class="flex justify-between items-center mb-4 border-b border-cyan-500/20 pb-4">
                 <h2 class="glow text-lg">SYSTEM_LOG_EXPLORER</h2>
-                <button onclick="closeLogExplorer()" class="text-pink-500 hover:text-white font-bold text-xs">[ CLOSE_ESCAPE ]</button>
+                <button onclick="closeLogExplorer()" class="text-pink-500 hover:text-white font-bold text-xs">[ CLOSE_X ]</button>
             </div>
-            <textarea id="log-content" readonly class="flex-1 bg-black/40 p-4 text-cyan-400 font-mono text-[10px] resize-none outline-none border border-white/5" placeholder="Awaiting data stream..."></textarea>
-            <div class="mt-4 flex justify-between items-center">
+            <textarea id="log-content" readonly class="flex-1 bg-black/40 p-4 text-cyan-400 font-mono text-[10px] resize-none outline-none border border-white/5"></textarea>
+            <div class="mt-4 flex justify-between">
                 <button onclick="copyLogs()" class="btn">Copy_To_Clipboard</button>
-                <span class="text-[8px] text-slate-600 italic">// END_OF_VOLATILE_BUFFER</span>
+                <span class="text-[8px] text-slate-600 italic">// VOLATILE_LOG_BUFFER</span>
             </div>
         </div>
     </div>
 
-    <div class="relative z-10 h-screen flex flex-col p-6">
+    <div id="main-ui" class="relative z-10 h-screen flex flex-col p-6 ui-visible">
         <div id="header-panel" class="flex justify-between items-center mb-6 p-4 panel border-l-4 border-l-[#00f2ff]">
             <div>
                 <h1 class="text-xl font-black italic glow">WOLF_SYSOP</h1>
                 <div class="flex gap-4 mt-1 text-[9px]">
-                    <span class="text-cyan-400">UP: <span id="stat-up">--</span></span>
-                    <span class="text-slate-500">TOTAL_TRAFFIC: <span id="stat-total">--</span></span>
+                    <span class="text-cyan-400">UPTIME: <span id="stat-up">--</span></span>
+                    <span class="text-slate-500">TRAFFIC: <span id="stat-total">--</span></span>
                 </div>
             </div>
             <div class="flex gap-3">
@@ -706,20 +717,18 @@ const dashboardHTML = `
         </div>
 
         <div class="grid grid-cols-12 gap-6 flex-1 overflow-hidden">
-            <div class="col-span-8 flex flex-col gap-6 overflow-hidden">
-                <div class="panel flex-1 overflow-hidden flex flex-col">
-                    <div class="p-3 border-b border-white/5 bg-white/5 text-[10px] font-bold text-cyan-400 flex justify-between">
-                        <span>NODE_REGISTRY</span>
-                        <span id="stat-count">0 ACTIVE</span>
-                    </div>
-                    <div class="overflow-y-auto flex-1">
-                        <table class="w-full text-left text-[11px]">
-                            <thead class="sticky top-0 bg-[#0a0f1c] text-slate-500 uppercase text-[8px]">
-                                <tr><th class="p-4">Identity</th><th class="p-4">Location</th><th class="p-4">Status</th><th class="p-4 text-right">Control</th></tr>
-                            </thead>
-                            <tbody id="peer-list"></tbody>
-                        </table>
-                    </div>
+            <div class="col-span-8 panel overflow-hidden flex flex-col">
+                <div class="p-3 border-b border-white/5 bg-white/5 text-[10px] font-bold text-cyan-400 flex justify-between">
+                    <span>NODE_REGISTRY</span>
+                    <span id="stat-count">0 ACTIVE</span>
+                </div>
+                <div class="overflow-y-auto flex-1">
+                    <table class="w-full text-left text-[11px]">
+                        <thead class="sticky top-0 bg-[#0a0f1c] text-slate-500 uppercase text-[8px]">
+                            <tr><th class="p-4">Identity</th><th class="p-4">Location</th><th class="p-4">Status</th><th class="p-4 text-right">Control</th></tr>
+                        </thead>
+                        <tbody id="peer-list"></tbody>
+                    </table>
                 </div>
             </div>
 
@@ -727,31 +736,50 @@ const dashboardHTML = `
                 <div class="panel p-4 h-1/3">
                     <canvas id="trafficChart"></canvas>
                 </div>
-                <div class="panel p-4 flex-1 overflow-y-auto font-mono text-[9px] text-cyan-800" id="log-container">
-                    <div>[SYSTEM] INITIALIZING_DASHBOARD...</div>
+                <div class="panel p-4 flex-1 overflow-y-auto font-mono text-[9px] text-cyan-900" id="log-container">
+                    <div>[SYSTEM] INITIALIZING...</div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        const svg = d3.select("#world-map").append("svg").attr("width", "100%").attr("height", "100%");
+        // --- MAP ENGINE ---
+        const svg = d3.select("#world-map").append("svg");
         const mapGroup = svg.append("g");
-        const projection = d3.geoMercator().scale(150).translate([window.innerWidth/2, window.innerHeight/1.5]);
+        const width = window.innerWidth, height = window.innerHeight;
+        const projection = d3.geoMercator().scale(width / 6.5).translate([width / 2, height / 1.5]);
+        const path = d3.geoPath().projection(projection);
 
         d3.json("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json").then(data => {
             mapGroup.selectAll("path").data(topojson.feature(data, data.objects.countries).features)
-                .enter().append("path").attr("d", d3.geoPath().projection(projection))
-                .attr("fill", "#0f172a").attr("stroke", "#1e293b");
+                .enter().append("path").attr("d", path)
+                .attr("fill", "#050a14").attr("stroke", "#00f2ff").attr("stroke-width", "0.5").attr("opacity", "0.6");
         });
 
+        // --- GHOST MODE LOGIC ---
+        let uiHidden = false;
+        function toggleUI() {
+            uiHidden = !uiHidden;
+            const ui = document.getElementById('main-ui');
+            const btn = document.getElementById('hud-toggle');
+            if(uiHidden) {
+                ui.classList.replace('ui-visible', 'ui-hidden');
+                btn.innerText = "Show_Interface [H]";
+            } else {
+                ui.classList.replace('ui-hidden', 'ui-visible');
+                btn.innerText = "Hide_Interface [H]";
+            }
+        }
+        document.addEventListener('keydown', (e) => { if(e.key.toLowerCase() === 'h') toggleUI(); });
+
+        // --- DATA UPDATER ---
         async function update() {
             try {
                 const r = await fetch("/api/stats");
                 const d = await r.json();
-                
                 document.getElementById("stat-total").innerText = d.total;
-                document.getElementById("stat-count").innerText = d.count + " ACTIVE NODES";
+                document.getElementById("stat-count").innerText = d.count + " NODES";
                 document.getElementById("stat-up").innerText = d.up;
 
                 const isLocked = d.lockdown === 1;
@@ -762,7 +790,7 @@ const dashboardHTML = `
                 tbody.innerHTML = "";
                 (d.peers || []).forEach(p => {
                     const row = document.createElement("tr");
-                    row.className = "border-b border-white/5 hover:bg-white/5 transition-colors";
+                    row.className = "border-b border-white/5 hover:bg-white/5";
                     row.innerHTML = '<td class="p-4"><div class="text-white font-bold">' + p.display_id + '</div><div class="text-[9px] text-cyan-600">' + p.ip + '</div></td>' +
                         '<td class="p-4"><span class="text-lg">' + (p.flag || '🌐') + '</span> <span class="ml-2 text-slate-300">' + (p.city || 'Unknown') + '</span></td>' +
                         '<td class="p-4"><span class="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 text-[8px]">' + p.status + '</span></td>' +
@@ -773,26 +801,23 @@ const dashboardHTML = `
                     tbody.appendChild(row);
                 });
 
-                if (d.hist) {
-                    chart.data.datasets[0].data = d.hist;
-                    chart.update('none');
-                }
+                if (d.hist) { chart.data.datasets[0].data = d.hist; chart.update('none'); }
 
                 const dots = mapGroup.selectAll(".dot").data(d.peers, p => p.id);
                 dots.exit().remove();
-                dots.enter().append("circle").attr("class", "dot").attr("r", 3).attr("fill", "#00f2ff")
+                dots.enter().append("circle").attr("class", "dot").attr("r", 4).attr("fill", "#00f2ff")
+                    .attr("filter", "drop-shadow(0 0 5px #00f2ff)")
                     .merge(dots)
                     .attr("cx", p => projection([p.lon, p.lat])[0])
                     .attr("cy", p => projection([p.lon, p.lat])[1]);
-
-            } catch (e) { console.error("Poll error", e); }
+            } catch (e) {}
         }
 
         async function adminAction(a, t = "") {
             await fetch("/api/admin?action=" + a + "&target=" + t);
             const log = document.getElementById('log-container');
             const div = document.createElement('div');
-            div.innerText = "[" + new Date().toLocaleTimeString() + "] EXEC: " + a.toUpperCase() + " " + (t.length > 15 ? t.substring(0,8) : t);
+            div.innerText = "[" + new Date().toLocaleTimeString() + "] " + a.toUpperCase() + " " + (t.length > 10 ? t.substring(0,6) : t);
             log.prepend(div);
             update();
         }
@@ -800,20 +825,10 @@ const dashboardHTML = `
         async function openLogExplorer() {
             document.getElementById('log-modal').classList.remove('hidden');
             const r = await fetch("/api/admin?action=get_logs");
-            const text = await r.text();
-            document.getElementById('log-content').value = text || "[SYSTEM] NO_LOGS_RETRIEVED";
+            document.getElementById('log-content').value = await r.text();
         }
-
-        function closeLogExplorer() {
-            document.getElementById('log-modal').classList.add('hidden');
-        }
-
-        function copyLogs() {
-            const el = document.getElementById('log-content');
-            el.select();
-            document.execCommand('copy');
-            alert("SYSOP_DATA_COPIED_TO_CLIPBOARD");
-        }
+        function closeLogExplorer() { document.getElementById('log-modal').classList.add('hidden'); }
+        function copyLogs() { document.getElementById('log-content').select(); document.execCommand('copy'); }
 
         const chart = new Chart(document.getElementById('trafficChart'), {
             type: 'line',
