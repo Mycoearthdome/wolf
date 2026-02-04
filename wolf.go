@@ -33,7 +33,6 @@ const (
 	TUN_MTU     = 1350
 	OVERHEAD    = 1 + 12 + 16
 	WINDOW_SIZE = 64
-	SESSION_TTL = 300
 )
 
 const (
@@ -59,6 +58,15 @@ type SessionManager struct {
 	ByIdentity sync.Map
 	ByAddr     sync.Map
 	ByIP       sync.Map
+}
+
+type PeerStat struct {
+	ID     string `json:"id"`
+	IP     string `json:"ip"`
+	TX     string `json:"tx"`
+	RX     string `json:"rx"`
+	LT     int64  `json:"lt"`
+	Status string `json:"status"`
 }
 
 var (
@@ -148,46 +156,48 @@ func openPacket(raw []byte, aead cipher.AEAD) ([]byte, uint64, error) {
 	return out, seq, err
 }
 
-func setupNetworking(name string, peerIP string, isServer bool) {
+func setupNetworking(name string, peerStr string, isServer bool) {
 	outFwd, _ := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
 	origForwarding = strings.TrimSpace(string(outFwd))
+
+	// Find the physical interface and gateway
 	outRoute, _ := exec.Command("ip", "route", "show", "default").Output()
 	fields := strings.Fields(string(outRoute))
-	var gw, dev string
+	var dev, gateway string
 	for i, f := range fields {
-		if f == "via" {
-			gw = fields[i+1]
-		}
 		if f == "dev" {
 			dev = fields[i+1]
 		}
+		if f == "via" {
+			gateway = fields[i+1]
+		}
 	}
+
 	runCmd("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU))
+
 	if isServer {
+		fmt.Println("[SYS] Mode: SERVER | Interface:", name)
 		runCmd("ip", "addr", "replace", "10.0.0.1/24", "dev", name)
 		runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
-		runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
-		runCmd("iptables", "-A", "FORWARD", "-i", name, "-j", "ACCEPT")
-	} else if peerIP != "" {
-		runCmd("ip", "route", "add", peerIP, "via", gw, "dev", dev)
-		runCmd("iptables", "-N", "WOLF_VPN")
-		runCmd("iptables", "-I", "OUTPUT", "1", "-j", "WOLF_VPN")
-		runCmd("iptables", "-A", "WOLF_VPN", "-o", "lo", "-j", "ACCEPT")
-		runCmd("iptables", "-A", "WOLF_VPN", "-d", peerIP, "-p", "udp", "-j", "ACCEPT")
-		runCmd("iptables", "-A", "WOLF_VPN", "-o", name, "-j", "ACCEPT")
-		runCmd("iptables", "-A", "WOLF_VPN", "-j", "DROP")
-		runCmd("ip", "route", "add", "0.0.0.0/1", "dev", name)
-		runCmd("ip", "route", "add", "128.0.0.0/1", "dev", name)
+		if dev != "" {
+			runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
+			runCmd("iptables", "-A", "FORWARD", "-i", name, "-j", "ACCEPT")
+		}
+	} else {
+		fmt.Println("[SYS] Mode: CLIENT | Target:", peerStr)
+		// Extract server IP to prevent routing loops
+		serverIP := strings.Split(peerStr, ":")[0]
+		if serverIP != "" && gateway != "" {
+			// Pin the server's IP to the physical gateway
+			runCmd("ip", "route", "add", serverIP, "via", gateway)
+		}
 	}
 }
 
 func cleanup(isServer bool) {
+	fmt.Println("\n[SYS] Cleaning up...")
 	if isServer {
 		runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
-	} else {
-		runCmd("iptables", "-D", "OUTPUT", "-j", "WOLF_VPN")
-		runCmd("iptables", "-F", "WOLF_VPN")
-		runCmd("iptables", "-X", "WOLF_VPN")
 	}
 	runCmd("sysctl", "-w", "net.ipv4.ip_forward="+origForwarding)
 	os.Exit(0)
@@ -202,18 +212,21 @@ func main() {
 	flag.Parse()
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	tun, _ := water.New(water.Config{DeviceType: water.TUN})
-
-	var currentTarget *net.UDPAddr
-	var targetHost string
-	if *tAddrStr != "" {
-		currentTarget, _ = net.ResolveUDPAddr("udp", *tAddrStr)
-		if currentTarget != nil {
-			targetHost = currentTarget.IP.String()
-		}
+	tun, err := water.New(water.Config{DeviceType: water.TUN})
+	if err != nil {
+		fmt.Println("Err TUN:", err)
+		return
 	}
 
-	setupNetworking(tun.Name(), targetHost, *isServer)
+	var currentTarget *net.UDPAddr
+	if *tAddrStr != "" {
+		if !strings.Contains(*tAddrStr, ":") {
+			*tAddrStr += ":9000"
+		}
+		currentTarget, _ = net.ResolveUDPAddr("udp", *tAddrStr)
+	}
+
+	setupNetworking(tun.Name(), *tAddrStr, *isServer)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -221,161 +234,84 @@ func main() {
 
 	lAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", *lPort))
 	conn, _ = net.ListenUDP("udp", lAddr)
-
 	myPriv, myPub := generateKeys()
 
+	// --- 1. Stats & Web UI (Server Only) ---
 	if *isServer {
+		historyMu.Lock()
+		trafficHistory = make([]uint64, 60)
+		historyMu.Unlock()
+
 		go func() {
-			for range time.Tick(1 * time.Second) {
+			var lastTotal uint64
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				currentTotal := atomic.LoadUint64(&totalBytes)
+				delta := uint64(0)
+				if currentTotal >= lastTotal {
+					delta = currentTotal - lastTotal
+				}
+				lastTotal = currentTotal
+
 				historyMu.Lock()
-				trafficHistory = append(trafficHistory, atomic.LoadUint64(&totalBytes))
+				trafficHistory = append(trafficHistory, delta)
 				if len(trafficHistory) > 60 {
-					trafficHistory = trafficHistory[1:]
+					trafficHistory = trafficHistory[len(trafficHistory)-60:]
 				}
 				historyMu.Unlock()
 			}
 		}()
 
 		http.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-			type PeerStat struct {
-				ID       string `json:"id"`
-				IP       string `json:"ip"`
-				Ext      string `json:"ext"`
-				TX       string `json:"tx"`
-				RX       string `json:"rx"`
-				LastSeen int64  `json:"lastSeen"`
-			}
 			peers := []PeerStat{}
 			mgr.ByIdentity.Range(func(k, v interface{}) bool {
 				s := v.(*UserSession)
+				ls := atomic.LoadInt64(&s.LastSeen)
+				status := "STABLE"
+				if time.Now().Unix()-ls > 20 {
+					status = "LAGGING"
+				}
+
 				peers = append(peers, PeerStat{
-					ID: k.(string)[:12], IP: s.InternalIP, Ext: s.Addr.String(),
-					TX: formatBytes(atomic.LoadUint64(&s.BytesOut)), RX: formatBytes(atomic.LoadUint64(&s.BytesIn)),
-					LastSeen: time.Now().Unix() - atomic.LoadInt64(&s.LastSeen),
+					ID:     k.(string)[:8],
+					IP:     s.InternalIP,
+					TX:     formatBytes(atomic.LoadUint64(&s.BytesOut)),
+					RX:     formatBytes(atomic.LoadUint64(&s.BytesIn)),
+					LT:     time.Now().Unix() - ls,
+					Status: status,
 				})
 				return true
 			})
 
 			historyMu.RLock()
-			defer historyMu.RUnlock()
+			histCopy := make([]uint64, len(trafficHistory))
+			copy(histCopy, trafficHistory)
+			historyMu.RUnlock()
+
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"totalBytes": formatBytes(atomic.LoadUint64(&totalBytes)),
-				"peerCount":  len(peers),
-				"peers":      peers,
-				"history":    trafficHistory,
-				"uptime":     time.Since(startTime).Truncate(time.Second).String(),
+				"total": formatBytes(atomic.LoadUint64(&totalBytes)),
+				"count": len(peers),
+				"peers": peers,
+				"hist":  histCopy,
+				"up":    time.Since(startTime).Truncate(time.Second).String(),
+				"gr":    runtime.NumGoroutine(),
 			})
 		})
 
+		http.HandleFunc("/api/admin", adminHandler)
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
-			fmt.Fprint(w, `
-			<!DOCTYPE html>
-			<html>
-			<head>
-				<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-				<script src="https://cdn.tailwindcss.com"></script>
-				<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-				<title>Wolf VPN</title>
-				<style>
-					body { background: #0b0f1a; color: #e2e8f0; font-family: sans-serif; }
-					.glass { background: rgba(23, 32, 53, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.05); }
-				</style>
-			</head>
-			<body class="p-4 md:p-10">
-				<div class="max-w-6xl mx-auto">
-					<header class="flex justify-between items-center mb-10">
-						<h1 class="text-3xl font-black italic text-blue-400">WOLF_VPN</h1>
-						<div class="glass px-4 py-2 rounded-xl text-xs font-mono text-slate-400" id="clock">--:--:--</div>
-					</header>
-					<div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-10">
-						<div class="lg:col-span-2 glass p-6 rounded-3xl">
-							<h3 class="text-slate-500 text-xs font-bold uppercase mb-4 tracking-widest">Network Throughput</h3>
-							<div class="h-48"><canvas id="trafficChart"></canvas></div>
-						</div>
-						<div class="grid grid-cols-1 gap-4">
-							<div class="glass p-6 rounded-2xl border-l-4 border-blue-500">
-								<h3 class="text-slate-500 text-xs font-bold uppercase mb-1">Total Data</h3>
-								<p class="text-2xl font-mono font-bold" id="stat-total">0 B</p>
-							</div>
-							<div class="glass p-6 rounded-2xl border-l-4 border-emerald-500">
-								<h3 class="text-slate-500 text-xs font-bold uppercase mb-1">Active Peers</h3>
-								<p class="text-2xl font-mono font-bold" id="stat-peers">0</p>
-							</div>
-							<div class="glass p-6 rounded-2xl border-l-4 border-purple-500">
-								<h3 class="text-slate-500 text-xs font-bold uppercase mb-1">Uptime</h3>
-								<p class="text-2xl font-mono font-bold" id="stat-uptime">0s</p>
-							</div>
-						</div>
-					</div>
-					<div class="glass rounded-3xl overflow-hidden">
-						<table class="w-full text-left">
-							<thead class="bg-white/5 text-[10px] uppercase text-slate-500 tracking-widest">
-								<tr><th class="px-8 py-4">Peer ID</th><th class="px-8 py-4">Internal IP</th><th class="px-8 py-4">External IP</th><th class="px-8 py-4">TX/RX</th><th class="px-8 py-4 text-right">Status</th></tr>
-							</thead>
-							<tbody id="peer-list" class="divide-y divide-white/5"></tbody>
-						</table>
-					</div>
-				</div>
-				<script>
-					const ctx = document.getElementById('trafficChart').getContext('2d');
-					const chart = new Chart(ctx, {
-						type: 'line',
-						data: {
-							labels: Array(60).fill(''),
-							datasets: [{
-								data: [], borderColor: '#60a5fa', backgroundColor: 'rgba(96, 165, 250, 0.1)',
-								fill: true, tension: 0.4, pointRadius: 0
-							}]
-						},
-						options: { 
-							responsive: true, maintainAspectRatio: false,
-							plugins: { legend: { display: false } },
-							scales: { x: { display: false }, y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b', font: { size: 10 } } } }
-						}
-					});
-
-					async function updateStats() {
-						try {
-							const res = await fetch('/api/stats');
-							const data = await res.json();
-							if (!data) return;
-
-							document.getElementById('stat-total').innerText = data.totalBytes || '0 B';
-							document.getElementById('stat-peers').innerText = data.peerCount || 0;
-							document.getElementById('stat-uptime').innerText = data.uptime || '0s';
-							document.getElementById('clock').innerText = new Date().toLocaleTimeString();
-
-							chart.data.datasets[0].data = data.history || [];
-							chart.update('none');
-
-							const tbody = document.getElementById('peer-list');
-							const peers = data.peers || [];
-							if (peers.length === 0) {
-								tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-slate-600 italic">No peers connected</td></tr>';
-							} else {
-								tbody.innerHTML = peers.map(function(p) {
-									return '<tr class="hover:bg-white/5 transition-colors">' +
-										'<td class="px-8 py-5 font-mono text-xs text-blue-300">' + p.id + '...</td>' +
-										'<td class="px-8 py-5"><span class="bg-emerald-500/10 text-emerald-400 px-2 py-1 rounded text-sm font-mono">' + p.ip + '</span></td>' +
-										'<td class="px-8 py-5 font-mono text-xs text-slate-500">' + p.ext + '</td>' +
-										'<td class="px-8 py-5 text-xs font-mono text-slate-400">↑' + p.tx + ' ↓' + p.rx + '</td>' +
-										'<td class="px-8 py-5 text-right font-bold text-xs ' + (p.lastSeen < 30 ? 'text-emerald-400' : 'text-amber-500') + '">' + p.lastSeen + 's ago</td>' +
-									'</tr>';
-								}).join('');
-							}
-						} catch (e) { console.error("Stats fetch failed", e); }
-					}
-					setInterval(updateStats, 1000);
-					updateStats();
-				</script>
-			</body>
-			</html>`)
+			fmt.Fprint(w, dashboardHTML)
 		})
+
+		fmt.Printf("[WEB] Dashboard active on :%d\n", *apiPort)
 		go http.ListenAndServe(fmt.Sprintf(":%d", *apiPort), nil)
 	}
 
+	// --- 2. UDP Receiver ---
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
 			for {
@@ -384,28 +320,26 @@ func main() {
 				if err != nil {
 					continue
 				}
+
 				switch buf[0] {
 				case OP_DATA:
-					var aead cipher.AEAD
-					var s *UserSession
 					if val, ok := mgr.ByAddr.Load(rem.String()); ok {
-						s = val.(*UserSession)
-						aead = s.AEAD
+						s := val.(*UserSession)
+						atomic.AddUint64(&s.BytesIn, uint64(n))
+						atomic.AddUint64(&totalBytes, uint64(n))
+						atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
+
+						plain, seq, err := openPacket(buf[:n], s.AEAD)
+						if err == nil && s.VerifySeq(seq) {
+							tun.Write(plain)
+						}
 					} else if !*isServer {
 						if val := clientAEAD.Load(); val != nil {
-							aead = val.(cipher.AEAD)
-						}
-					}
-					if aead != nil {
-						plain, seq, err := openPacket(buf[:n], aead)
-						if err == nil && (!*isServer || s.VerifySeq(seq)) {
-							tun.Write(plain)
-							if *isServer {
-								atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
-								atomic.AddUint64(&s.BytesIn, uint64(n))
-								atomic.AddUint64(&totalBytes, uint64(n))
-							} else {
-								atomic.StoreInt64(&lastActivity, time.Now().Unix())
+							atomic.AddUint64(&totalBytes, uint64(n))
+							atomic.StoreInt64(&lastActivity, time.Now().Unix())
+							plain, _, err := openPacket(buf[:n], val.(cipher.AEAD))
+							if err == nil {
+								tun.Write(plain)
 							}
 						}
 					}
@@ -417,13 +351,13 @@ func main() {
 							var s *UserSession
 							if val, ok := mgr.ByIdentity.Load(id); ok {
 								s = val.(*UserSession)
-								s.Addr = rem // Update external IP if it changed
+								s.Addr = rem
 							} else {
-								var assignedIP string
+								assignedIP := ""
 								for i := 2; i < 255; i++ {
-									candidate := fmt.Sprintf("10.0.0.%d", i)
-									if _, occupied := mgr.ByIP.Load(candidate); !occupied {
-										assignedIP = candidate
+									ip := fmt.Sprintf("10.0.0.%d", i)
+									if _, occupied := mgr.ByIP.Load(ip); !occupied {
+										assignedIP = ip
 										break
 									}
 								}
@@ -441,15 +375,42 @@ func main() {
 								atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
 								resp := append([]byte{OP_AUTH}, myPub[:]...)
 								conn.WriteToUDP(append(resp, []byte(s.InternalIP)...), rem)
+								fmt.Printf("[AUTH] Peer %s @ %s\n", id[:8], s.InternalIP)
 							}
 						}
-					} else if !*isServer {
+					} else if !*isServer && n >= 33 {
 						var sp [32]byte
 						copy(sp[:], buf[1:33])
 						clientAEAD.Store(func() cipher.AEAD { a, _ := chacha20poly1305.New(deriveKey(myPriv, sp)); return a }())
 						assignedIP := string(buf[33:n])
-						runCmd("ip", "addr", "flush", "dev", tun.Name())
-						runCmd("ip", "addr", "add", assignedIP+"/24", "dev", tun.Name())
+
+						fmt.Println("[AUTH] Handshake success. Configuring tunnel...")
+						runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
+
+						// --- FIX: PIN SERVER IP TO PHYSICAL GATEWAY ---
+						out, _ := exec.Command("ip", "route", "show", "default").Output()
+						fields := strings.Fields(string(out))
+						var gateway string
+						for i, f := range fields {
+							if f == "via" {
+								gateway = fields[i+1]
+								break
+							}
+						}
+						if currentTarget != nil && gateway != "" {
+							serverIP := currentTarget.IP.String()
+							runCmd("ip", "route", "add", serverIP, "via", gateway)
+							fmt.Printf("[SYS] Pinned server %s via physical gateway %s\n", serverIP, gateway)
+						}
+
+						// --- REDIRECT ALL TRAFFIC ---
+						runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
+						runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
+
+						// --- DNS PROTECTION ---
+						runCmd("resolvectl", "dns", tun.Name(), "8.8.8.8")
+						runCmd("resolvectl", "domain", tun.Name(), "~.")
+
 						atomic.StoreInt64(&lastActivity, time.Now().Unix())
 					}
 				case OP_KEEPALIVE:
@@ -462,16 +423,11 @@ func main() {
 		}()
 	}
 
+	// --- 3. Handshake / Keepalive ---
 	go func() {
-		for range time.Tick(10 * time.Second) {
-			if !*isServer && *tAddrStr != "" {
-				if addr, err := net.ResolveUDPAddr("udp", *tAddrStr); err == nil {
-					currentTarget = addr
-				}
-				if currentTarget == nil {
-					continue
-				}
-				if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 20 {
+		for range time.Tick(5 * time.Second) {
+			if !*isServer && currentTarget != nil {
+				if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 15 {
 					req := append([]byte{OP_AUTH}, myPub[:]...)
 					conn.WriteToUDP(append(req, signAuth([]byte(*pass), myPub[:])...), currentTarget)
 				} else {
@@ -481,24 +437,194 @@ func main() {
 		}
 	}()
 
+	// --- 4. TUN Reader ---
 	for {
 		pkt := make([]byte, 2048)
-		n, _ := tun.Read(pkt)
-		tx := make([]byte, 2048)
-		tx[0] = OP_DATA
+		n, err := tun.Read(pkt)
+		if err != nil {
+			continue
+		}
+
 		if *isServer && n >= 20 {
 			destIP := net.IP(pkt[16:20]).String()
 			if val, ok := mgr.ByIP.Load(destIP); ok {
 				s := val.(*UserSession)
+				tx := make([]byte, n+OVERHEAD)
+				tx[0] = OP_DATA
 				encrypted := sealPacket(tx, s.AEAD, atomic.AddUint64(&s.SeqOut, 1), pkt[:n])
 				conn.WriteToUDP(encrypted, s.Addr)
-				atomic.AddUint64(&s.BytesOut, uint64(len(encrypted)))
-				atomic.AddUint64(&totalBytes, uint64(len(encrypted)))
+
+				sent := uint64(len(encrypted))
+				atomic.AddUint64(&s.BytesOut, sent)
+				atomic.AddUint64(&totalBytes, sent)
 			}
 		} else if !*isServer {
 			if val := clientAEAD.Load(); val != nil && currentTarget != nil {
-				conn.WriteToUDP(sealPacket(tx, val.(cipher.AEAD), atomic.AddUint64(&clientSeq, 1), pkt[:n]), currentTarget)
+				tx := make([]byte, n+OVERHEAD)
+				tx[0] = OP_DATA
+				enc := sealPacket(tx, val.(cipher.AEAD), atomic.AddUint64(&clientSeq, 1), pkt[:n])
+				conn.WriteToUDP(enc, currentTarget)
+				atomic.AddUint64(&totalBytes, uint64(len(enc)))
 			}
 		}
 	}
+}
+
+const dashboardHTML = `
+<!DOCTYPE html>
+<html class="dark">
+<head>
+    <meta charset="UTF-8">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+        body { background: #020408; color: #94a3b8; font-family: 'JetBrains Mono', monospace; }
+        .panel { background: #0f172a; border: 1px solid #1e293b; }
+        .chart-box { position: relative; height: 180px; width: 100%; }
+        .btn-sys { padding: 4px 12px; border-radius: 4px; font-size: 10px; font-weight: bold; text-transform: uppercase; border: 1px solid transparent; cursor: pointer; }
+        .btn-danger { color: #ef4444; border-color: #450a0a; background: #1a0505; }
+        .btn-primary { color: #3b82f6; border-color: #1e3a8a; background: #0f172a; }
+    </style>
+</head>
+<body class="p-4">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-6 bg-slate-900/50 p-4 border border-slate-800 rounded-lg">
+            <h1 class="text-white font-black italic text-xl">WOLF_SYSOP</h1>
+            <div class="flex gap-2">
+                <button onclick="adminAction('reset_stats')" class="btn-sys btn-primary">Reset Stats</button>
+                <button onclick="adminAction('shutdown')" class="btn-sys btn-danger">Shutdown</button>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+            <div class="lg:col-span-3 space-y-6">
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div class="panel p-4 rounded-lg">
+                        <div class="text-[9px] uppercase mb-1">Total Traffic</div>
+                        <div class="text-xl text-white font-bold" id="stat-total">0 B</div>
+                    </div>
+                    <div class="panel p-4 rounded-lg border-l-2 border-l-blue-500">
+                        <div class="text-[9px] uppercase mb-1">Current Speed</div>
+                        <div class="text-xl text-white font-bold" id="stat-bps">0 B/s</div>
+                    </div>
+                </div>
+
+                <div class="panel p-6 rounded-xl">
+                    <canvas id="trafficChart"></canvas>
+                </div>
+
+                <div class="panel rounded-xl overflow-hidden">
+                    <table class="w-full text-left text-xs">
+                        <thead class="bg-slate-800/40 text-slate-500 uppercase">
+                            <tr>
+                                <th class="p-4">Identity</th>
+                                <th class="p-4">IP</th>
+                                <th class="p-4">Stats</th>
+                                <th class="p-4 text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="peer-list"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <div class="panel rounded-xl p-4 text-[10px] font-mono h-[400px] overflow-y-auto" id="log-container">
+                <div class="text-slate-600 italic">SYSTEM READY...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Use standard string concatenation to avoid backtick issues in some Go versions
+        async function update() {
+            try {
+                const r = await fetch("/api/stats");
+                const d = await r.json();
+                
+                document.getElementById("stat-total").innerText = d.total;
+                if (d.hist && d.hist.length > 0) {
+                    document.getElementById("stat-bps").innerText = formatBytes(d.hist[d.hist.length-1]) + "/s";
+                    chart.data.datasets[0].data = d.hist;
+                    chart.update('none');
+                }
+
+                const tbody = document.getElementById("peer-list");
+                tbody.innerHTML = "";
+                (d.peers || []).forEach(p => {
+                    const row = document.createElement("tr");
+                    row.className = "border-b border-slate-800/30";
+                    row.innerHTML = '<td class="p-4 text-white font-bold">' + p.id + '</td>' +
+                                  '<td class="p-4 text-blue-400">' + p.ip + '</td>' +
+                                  '<td class="p-4">TX ' + p.tx + ' / RX ' + p.rx + '</td>' +
+                                  '<td class="p-4 text-right"><button onclick="adminAction(\'kick\', \'' + p.id + '\')" class="btn-sys btn-danger">Kick</button></td>';
+                    tbody.appendChild(row);
+                });
+            } catch(e) { console.error(e); }
+        }
+
+        function formatBytes(b) {
+            if (b === 0) return '0 B';
+            const i = Math.floor(Math.log(b) / Math.log(1024));
+            return (b / Math.pow(1024, i)).toFixed(1) + ' ' + ['B', 'KB', 'MB', 'GB'][i];
+        }
+
+        const chart = new Chart(document.getElementById("trafficChart"), {
+            type: "line",
+            data: {
+                labels: Array(60).fill(""),
+                datasets: [{ data: Array(60).fill(0), borderColor: "#3b82f6", tension: 0.3, fill: true }]
+            },
+            options: { scales: { x: { display: false }, y: { beginAtZero: true } }, plugins: { legend: false } }
+        });
+
+        async function adminAction(a, t="") {
+            await fetch("/api/admin?action=" + a + "&target=" + t);
+            update();
+        }
+
+        setInterval(update, 1000);
+    </script>
+</body>
+</html>
+`
+
+func adminHandler(w http.ResponseWriter, r *http.Request) {
+	action := r.URL.Query().Get("action")
+	target := r.URL.Query().Get("target")
+
+	switch action {
+	case "kick":
+		// Iterate through sessions to find the one matching the prefix
+		mgr.ByIdentity.Range(func(k, v interface{}) bool {
+			if strings.HasPrefix(k.(string), target) {
+				s := v.(*UserSession)
+				// Remove from all lookup maps
+				mgr.ByIdentity.Delete(k)
+				mgr.ByAddr.Delete(s.Addr.String())
+				mgr.ByIP.Delete(s.InternalIP)
+				fmt.Printf("[ADMIN] Kicked peer: %s\n", k.(string)[:8])
+				return false // Stop iterating
+			}
+			return true
+		})
+
+	case "reset_stats":
+		// Reset global counter
+		atomic.StoreUint64(&totalBytes, 0)
+		// Reset individual peer counters
+		mgr.ByIdentity.Range(func(k, v interface{}) bool {
+			s := v.(*UserSession)
+			atomic.StoreUint64(&s.BytesIn, 0)
+			atomic.StoreUint64(&s.BytesOut, 0)
+			return true
+		})
+		fmt.Println("[ADMIN] Statistics have been reset")
+
+	case "shutdown":
+		fmt.Println("[ADMIN] Remote shutdown initiated")
+		cleanup(true) // This calls your existing cleanup logic
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
