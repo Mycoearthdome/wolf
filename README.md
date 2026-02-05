@@ -95,9 +95,9 @@ once launched, type in your favorite internet browser:
 localhost:8080
 ```
 
-To see the world map of you connections:
+To see the world map of your VPN on the dashbord connections:
 
-press keyboard key " H "
+USE KEYBOARD KEY " H "
 
 📝 License
 
