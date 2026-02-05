@@ -30,7 +30,7 @@ import (
 
 // --- Constants ---
 const (
-	TUN_MTU     = 1350
+	TUN_MTU     = 1300
 	OVERHEAD    = 1 + 12 + 16
 	WINDOW_SIZE = 64
 )
