@@ -190,7 +190,7 @@ func setupNetworking(name string, peerStr string, isServer bool) {
 
 	if isServer {
 		fmt.Println("[SYS] Mode: SERVER | Interface:", name)
-		runCmd("ip", "addr", "replace", "10.0.0.1/24", "dev", name)
+		runCmd("ip", "addr", "replace", "10.0.0.1/16", "dev", name)
 		runCmd("sysctl", "-w", "net.ipv4.ip_forward=1")
 		if dev != "" {
 			runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
@@ -251,6 +251,33 @@ func main() {
 
 	// --- 1. Stats & Web UI (Server Only) ---
 	if *isServer {
+		// Read/Write buffers increased for /16 simultaneous connections
+
+		const bufferSize = 128 * 1024 * 1024 // 128MB
+
+		err = conn.SetReadBuffer(bufferSize)
+		if err != nil {
+			fmt.Printf("Warning: Failed to set ReadBuffer: %v\n", err)
+		}
+
+		err = conn.SetWriteBuffer(bufferSize)
+		if err != nil {
+			fmt.Printf("Warning: Failed to set WriteBuffer: %v\n", err)
+		}
+
+		// Set the open file limit (ulimit -n) to 65535 instead of 1024
+		var rLimit syscall.Rlimit
+		rLimit.Max = 65535
+		rLimit.Cur = 65535
+		err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+		if err != nil {
+			fmt.Printf("Warning: Could not set ulimit: %v\n", err)
+			// Check if we are running as root, as decreasing/increasing limits
+			// significantly usually requires higher privileges.
+		} else {
+			fmt.Println("[SYS] ulimit -n set to 65535")
+		}
+
 		historyMu.Lock()
 		trafficHistory = make([]uint64, 60)
 		historyMu.Unlock()
@@ -410,10 +437,20 @@ func main() {
 								continue
 							}
 							assignedIP := ""
-							for i := 2; i < 255; i++ {
-								ip := fmt.Sprintf("10.0.0.%d", i)
-								if _, occupied := mgr.ByIP.Load(ip); !occupied {
-									assignedIP = ip
+							found := false
+							for b1 := 0; b1 < 256; b1++ {
+								for b2 := 0; b2 < 256; b2++ {
+									if b1 == 0 && b2 <= 1 {
+										continue
+									} // Skip 10.0.0.0 and 10.0.0.1
+									ip := fmt.Sprintf("10.0.%d.%d", b1, b2)
+									if _, occupied := mgr.ByIP.Load(ip); !occupied {
+										assignedIP = ip
+										found = true
+										break
+									}
+								}
+								if found {
 									break
 								}
 							}
@@ -440,7 +477,7 @@ func main() {
 						aead, _ := chacha20poly1305.New(deriveKey(myPriv, sp))
 						clientAEAD.Store(aead)
 						assignedIP := string(buf[33:n])
-						runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
+						runCmd("ip", "addr", "replace", assignedIP+"/16", "dev", tun.Name())
 						out, _ := exec.Command("ip", "route", "show", "default").Output()
 						fields := strings.Fields(string(out))
 						var gw string
