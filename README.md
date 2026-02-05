@@ -34,7 +34,7 @@ A lightweight, secure VPN tunnel implementation written in pure Go. **Wolf VPN**
 
 ```bash
 # 1. Clone the repo
-git clone [https://github.com/Mycoearthdome/wolf.git](https://github.com/Mycoearthdome/wolf.git)
+git clone https://github.com/Mycoearthdome/wolf.git
 
 # 2. Navigate to project
 cd wolf
