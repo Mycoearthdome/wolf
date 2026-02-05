@@ -60,7 +60,7 @@ sudo ./wolf -l 9000 -server
 
 Connect to your remote Wolf VPN server.
 ```Bash
-sudo ./wolf -l 9000 -ip <SERVER_PUBLIC_IP>:9000
+sudo ./wolf -l 9000 -t <SERVER_PUBLIC_IP>:9000
 ```
 📂 Project Roadmap
 
