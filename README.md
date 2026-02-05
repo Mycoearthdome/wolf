@@ -13,10 +13,10 @@ A lightweight, secure VPN tunnel implementation written in pure Go. **Wolf VPN**
 
 ## ✨ Features
 
-- [x] **Zero Dependencies:** Built exclusively with the Go standard library.
 - [x] **Lightweight:** Minimal memory footprint and binary size.
 - [x] **Dual Role:** Same binary acts as both Server and Client.
 - [x] **Cross-Platform:** Full support for Linux and macOS (TUN/TAP).
+- [x] **KillSwitch:** only available on Linux iptables firewalls.
 
 ---
 
@@ -89,15 +89,19 @@ sudo ./wolf -l 9000 -ip [external server ip]:9000
 ```
 
 Explore the Dashboard:
+<img width="1893" height="911" alt="Wolf_SYSOP_1" src="https://github.com/user-attachments/assets/0b38d760-5419-4239-ae11-f139b66a351a" />
 
 once launched, type in your favorite internet browser:
 ```Bash
 localhost:8080
 ```
 
-To see the world map of your VPN on the dashbord connections:
+To see the world map of your VPN on the dashboard connections:
 
 USE KEYBOARD KEY " H "
+
+<img width="1893" height="911" alt="Wolf_SYSOP_2" src="https://github.com/user-attachments/assets/210e9bd0-4c55-479a-9909-1671b18114c9" />
+
 
 📝 License
 
