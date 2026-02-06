@@ -77,24 +77,25 @@ type GeoData struct {
 }
 
 var (
-	startTime      = time.Now()
-	mgr            = &SessionManager{}
-	conn           *net.UDPConn
-	origForwarding string
-	clientAEAD     atomic.Value
-	clientSeq      uint64
-	lastActivity   int64
-	totalBytes     uint64
-	historyMu      sync.RWMutex
-	trafficHistory = make([]uint64, 60)
-	bufferPool     = sync.Pool{New: func() interface{} { return make([]byte, 2048) }}
-	banMap         sync.Map // IP string -> int64 (expiry timestamp)
-	geoCache       sync.Map // IP string -> GeoData
-	globalLockdown uint32   // 0 = normal, 1 = drop all
-	sysLog         []string
-	logMu          sync.Mutex
-	serverDK       *xwing.DecapsulationKey // private key
-	myPubKey       []byte
+	startTime       = time.Now()
+	mgr             = &SessionManager{}
+	conn            *net.UDPConn
+	origForwarding  string
+	clientAEAD      atomic.Value
+	clientSeq       uint64
+	lastActivity    int64
+	totalBytes      uint64
+	historyMu       sync.RWMutex
+	trafficHistory  = make([]uint64, 60)
+	bufferPool      = sync.Pool{New: func() interface{} { return make([]byte, 2048) }}
+	banMap          sync.Map // IP string -> int64 (expiry timestamp)
+	geoCache        sync.Map // IP string -> GeoData
+	globalLockdown  uint32   // 0 = normal, 1 = drop all
+	sysLog          []string
+	logMu           sync.Mutex
+	serverDK        *xwing.DecapsulationKey // private key
+	myPubKey        []byte
+	ClientCurrentIP atomic.Value
 )
 
 // --- Helpers ---
@@ -397,29 +398,52 @@ func main() {
 						}
 
 						aead, _ := chacha20poly1305.New(ss)
-						_, ok := banMap.Load(strings.Split(rem.IP.String(), ":")[0])
-						if !ok {
-							assignedIP := allocateIP()
-							if assignedIP != "" {
-								s := &UserSession{Addr: rem, InternalIP: assignedIP, AEAD: aead, LastSeen: time.Now().Unix()}
-								nodeID := fmt.Sprintf("%x", sha256.Sum256([]byte(rem.String())))
-								mgr.ByIdentity.Store(nodeID, s)
-								mgr.ByAddr.Store(rem.String(), s)
-								mgr.ByIP.Store(assignedIP, s)
+						// 1. Check if this client already has an active session
+						if val, ok := mgr.ByAddr.Load(rem.String()); ok {
+							s := val.(*UserSession)
+							s.mu.Lock()
+							s.AEAD = aead // Update to the new PQC-secured keys
+							s.mu.Unlock()
+							atomic.StoreInt64(&s.LastSeen, time.Now().Unix())
 
-								go updateGeoInfo(rem.IP.String())
+							// Inform client of their EXISTING IP
+							conn.WriteToUDP(append([]byte{OP_KEM_REPLY}, []byte(s.InternalIP)...), rem)
+							//pushLog("RE-KEY: " + s.InternalIP + " (Keys Rotated)")
+						} else {
+							// 2. Original allocation logic for BRAND NEW clients
+							_, isBanned := banMap.Load(strings.Split(rem.IP.String(), ":")[0])
+							if !isBanned {
+								assignedIP := allocateIP()
+								if assignedIP != "" {
+									s := &UserSession{Addr: rem, InternalIP: assignedIP, AEAD: aead, LastSeen: time.Now().Unix()}
+									nodeID := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Split(rem.String(), ";")[0])))
+									mgr.ByIdentity.Store(nodeID, s)
+									mgr.ByAddr.Store(rem.String(), s)
+									mgr.ByIP.Store(assignedIP, s)
 
-								// Inform client of assigned IP
-								conn.WriteToUDP(append([]byte{OP_KEM_REPLY}, []byte(assignedIP)...), rem)
-								pushLog("NODE_JOIN: " + assignedIP + " (PQC SECURED)")
+									go updateGeoInfo(rem.IP.String())
+									conn.WriteToUDP(append([]byte{OP_KEM_REPLY}, []byte(assignedIP)...), rem)
+									pushLog("NODE_JOIN: " + assignedIP + " (PQC SECURED)")
+								}
 							}
 						}
 					} else if !*isServer {
-						// Client receives IP Assignment
+						// Client receives IP Assignment/Confirmation
 						assignedIP := string(buf[1:n])
-						runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
-						runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
-						runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
+
+						if ClientCurrentIP.Load() == nil {
+							// Only add routes if this is the very first assignment
+							runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
+							runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
+						}
+
+						if assignedIP != ClientCurrentIP.Load() {
+							fmt.Printf("[SYS] Configuring interface: %s\n", assignedIP)
+							runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
+						}
+
+						ClientCurrentIP.Store(assignedIP)
+						// Always update activity so the handshake trigger doesn't fire again immediately
 						atomic.StoreInt64(&lastActivity, time.Now().Unix())
 					}
 				}
@@ -706,12 +730,36 @@ const dashboardHTML = `
         :root { --cyan: #00f2ff; --pink: #ff0055; --bg: #020408; }
         body { background: var(--bg); color: #94a3b8; font-family: 'JetBrains Mono', monospace; overflow: hidden; margin: 0; height: 100vh; }
         
-        /* Map Container */
         #world-map { position: fixed; inset: 0; opacity: 0.4; z-index: 0; background: #000; pointer-events: none; }
-        #world-map svg { width: 100%; height: 100%; }
+        #world-map svg { width: 100%; height: 100%; pointer-events: none; }
 
-        /* UI State Transitions */
-        .ui-visible { opacity: 1; transition: opacity 0.5s ease, visibility 0.5s; }
+        @keyframes pulse-red {
+            0% { r: 2; opacity: 1; stroke-width: 0; }
+            50% { r: 6; opacity: 0.6; stroke: var(--pink); stroke-width: 10; }
+            100% { r: 2; opacity: 1; stroke-width: 0; }
+        }
+        
+        .dot { 
+            fill: var(--pink) !important; 
+            animation: pulse-red 2s infinite ease-in-out; 
+            cursor: crosshair;
+            pointer-events: all; 
+        }
+
+        #node-tooltip {
+            position: absolute;
+            display: none;
+            padding: 8px 12px;
+            background: rgba(5, 7, 10, 0.95);
+            border: 1px solid var(--pink);
+            color: white;
+            font-size: 10px;
+            z-index: 1000;
+            pointer-events: none;
+            box-shadow: 0 0 15px rgba(255, 0, 85, 0.4);
+        }
+
+        .ui-visible { opacity: 1; transition: opacity 0.5s ease; }
         .ui-hidden { opacity: 0; visibility: hidden; pointer-events: none; }
 
         .panel { background: rgba(10, 15, 28, 0.9); backdrop-filter: blur(10px); border: 1px solid rgba(0, 242, 255, 0.1); }
@@ -721,16 +769,13 @@ const dashboardHTML = `
         .btn { font-size: 10px; padding: 5px 15px; border: 1px solid var(--cyan); color: var(--cyan); cursor: pointer; text-transform: uppercase; clip-path: polygon(10% 0, 100% 0, 100% 70%, 90% 100%, 0 100%, 0 30%); transition: all 0.2s; }
         .btn:hover { background: var(--cyan); color: #000; box-shadow: 0 0 15px var(--cyan); }
         .btn-red { border-color: var(--pink); color: var(--pink); }
-        .btn-red:hover { background: var(--pink); color: #fff; box-shadow: 0 0 15px var(--pink); }
         
         #hud-toggle { position: fixed; bottom: 20px; right: 20px; z-index: 100; opacity: 0.5; }
-        #hud-toggle:hover { opacity: 1; }
-
-        .modal-content { background: #05070a; border: 1px solid var(--cyan); box-shadow: 0 0 50px rgba(0, 242, 255, 0.1); }
     </style>
 </head>
 <body>
     <div id="world-map"></div>
+    <div id="node-tooltip"></div>
 
     <button id="hud-toggle" onclick="toggleUI()" class="btn">Interface_Toggle [H]</button>
 
@@ -743,7 +788,6 @@ const dashboardHTML = `
             <textarea id="log-content" readonly class="flex-1 bg-black/40 p-4 text-cyan-400 font-mono text-[10px] resize-none outline-none border border-white/5"></textarea>
             <div class="mt-4 flex justify-between">
                 <button onclick="copyLogs()" class="btn">Copy_To_Clipboard</button>
-                <span class="text-[8px] text-slate-600 italic">// VOLATILE_LOG_BUFFER</span>
             </div>
         </div>
     </div>
@@ -791,9 +835,9 @@ const dashboardHTML = `
     </div>
 
     <script>
-        // --- MAP ENGINE ---
         const svg = d3.select("#world-map").append("svg");
         const mapGroup = svg.append("g");
+        const tooltip = d3.select("#node-tooltip");
         const width = window.innerWidth, height = window.innerHeight;
         const projection = d3.geoMercator().scale(width / 6.5).translate([width / 2, height / 1.5]);
         const path = d3.geoPath().projection(projection);
@@ -801,37 +845,29 @@ const dashboardHTML = `
         d3.json("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json").then(data => {
             mapGroup.selectAll("path").data(topojson.feature(data, data.objects.countries).features)
                 .enter().append("path").attr("d", path)
-                .attr("fill", "#050a14").attr("stroke", "#00f2ff").attr("stroke-width", "0.5").attr("opacity", "0.6");
+                .attr("fill", "#050a14").attr("stroke", "#00f2ff").attr("stroke-width", "0.5").attr("opacity", "0.4");
         });
 
-        // --- GHOST MODE LOGIC ---
         let uiHidden = false;
         function toggleUI() {
             uiHidden = !uiHidden;
             const ui = document.getElementById('main-ui');
-            const btn = document.getElementById('hud-toggle');
-            if(uiHidden) {
-                ui.classList.replace('ui-visible', 'ui-hidden');
-                btn.innerText = "Show_Interface [H]";
-            } else {
-                ui.classList.replace('ui-hidden', 'ui-visible');
-                btn.innerText = "Hide_Interface [H]";
-            }
+            ui.classList.toggle('ui-hidden', uiHidden);
+            ui.classList.toggle('ui-visible', !uiHidden);
+            document.getElementById('hud-toggle').innerText = uiHidden ? "Show_Interface [H]" : "Hide_Interface [H]";
         }
-        document.addEventListener('keydown', (e) => { if(e.key.toLowerCase() === 'h') toggleUI(); });
+        document.addEventListener('keydown', e => { 
+            if(e.key.toLowerCase()==='h' && e.target.tagName!=='TEXTAREA' && e.target.tagName!=='INPUT') toggleUI(); 
+        });
 
-        // --- DATA UPDATER ---
         async function update() {
             try {
                 const r = await fetch("/api/stats");
                 const d = await r.json();
+                
                 document.getElementById("stat-total").innerText = d.total;
                 document.getElementById("stat-count").innerText = d.count + " NODES";
                 document.getElementById("stat-up").innerText = d.up;
-
-                const isLocked = d.lockdown === 1;
-                document.getElementById("header-panel").classList.toggle('lockdown-ui', isLocked);
-                document.getElementById("lockdown-btn").innerText = isLocked ? "Disable Lockdown" : "Enable Lockdown";
 
                 const tbody = document.getElementById("peer-list");
                 tbody.innerHTML = "";
@@ -848,15 +884,27 @@ const dashboardHTML = `
                     tbody.appendChild(row);
                 });
 
-                if (d.hist) { chart.data.datasets[0].data = d.hist; chart.update('none'); }
-
                 const dots = mapGroup.selectAll(".dot").data(d.peers, p => p.id);
                 dots.exit().remove();
-                dots.enter().append("circle").attr("class", "dot").attr("r", 4).attr("fill", "#00f2ff")
-                    .attr("filter", "drop-shadow(0 0 5px #00f2ff)")
+                
+                dots.enter().append("circle")
+                    .attr("class", "dot")
+                    .attr("r", 4)
                     .merge(dots)
                     .attr("cx", p => projection([p.lon, p.lat])[0])
-                    .attr("cy", p => projection([p.lon, p.lat])[1]);
+                    .attr("cy", p => projection([p.lon, p.lat])[1])
+                    .on("mouseover", (e, p) => {
+                        tooltip.style("display", "block").html(
+                            '<div style="color:var(--pink);font-weight:bold">NODE: ' + p.display_id + '</div>' +
+                            '<div style="font-size:9px;opacity:0.8">' + p.city + ' (' + p.ext_ip + ')</div>' +
+                            '<div style="margin-top:4px;font-size:8px;color:#64748b">[CLICK TO BAN]</div>'
+                        );
+                    })
+                    .on("mousemove", e => tooltip.style("left", (e.pageX+15)+"px").style("top", (e.pageY-15)+"px"))
+                    .on("mouseout", () => tooltip.style("display", "none"))
+                    .on("click", (e, p) => { if(confirm("BAN "+p.ext_ip+"?")) adminAction('ban', p.ext_ip); });
+
+                if (d.hist) { chart.data.datasets[0].data = d.hist; chart.update('none'); }
             } catch (e) {}
         }
 
@@ -864,7 +912,7 @@ const dashboardHTML = `
             await fetch("/api/admin?action=" + a + "&target=" + t);
             const log = document.getElementById('log-container');
             const div = document.createElement('div');
-            div.innerText = "[" + new Date().toLocaleTimeString() + "] " + a.toUpperCase() + " " + (t.length > 10 ? t.substring(0,6) : t);
+            div.innerText = "[" + new Date().toLocaleTimeString() + "] " + a.toUpperCase() + " " + t;
             log.prepend(div);
             update();
         }
