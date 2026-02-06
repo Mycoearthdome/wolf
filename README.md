@@ -2,7 +2,7 @@
 
 ![Project Banner](https://img.shields.io/badge/Status-prod)
 [![License: CC0-1.0](https://img.shields.io/badge/License-CC0--1.0-lightgrey.svg)](http://creativecommons.org/publicdomain/zero/1.0/)
-[![Go Version](https://img.shields.io/badge/Go-1.18%2B-00ADD8?logo=go&logoColor=white)](https://golang.org/doc/devel/release.html)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](https://golang.org/doc/devel/release.html)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue)](#requirements)
 
 A lightweight, secure VPN tunnel implementation written in pure Go. **Wolf VPN** provides a simple way to create a Layer 3 (IP) tunnel between a server and a client without the overhead of massive configuration files.
