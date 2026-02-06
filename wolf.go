@@ -372,7 +372,7 @@ func main() {
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, dashboardHTML)
 		})
-		go http.ListenAndServe(fmt.Sprintf(":%d", *apiPort), nil)
+		go http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", *apiPort), nil)
 	}
 
 	// --- 2. UDP Receiver (Hybrid Handshake) ---
@@ -505,6 +505,7 @@ func main() {
 
 							// 3. NOW it is safe to hijack the routing table
 							runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
+							runCmd("ip", "route", "add", "10.0.0.1", "dev", tun.Name())
 							runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
 
 							// 4. Force the system to use our pinned DNS
@@ -513,7 +514,7 @@ func main() {
 
 						if assignedIP != ClientCurrentIP.Load() {
 							fmt.Printf("[SYS] Configuring interface: %s\n", assignedIP)
-							runCmd("ip", "addr", "replace", assignedIP+"/24", "dev", tun.Name())
+							runCmd("ip", "addr", "replace", assignedIP+"/32", "dev", tun.Name())
 						}
 
 						ClientCurrentIP.Store(assignedIP)
