@@ -397,20 +397,22 @@ func main() {
 						}
 
 						aead, _ := chacha20poly1305.New(ss)
+						_, ok := banMap.Load(strings.Split(rem.IP.String(), ":")[0])
+						if !ok {
+							assignedIP := allocateIP()
+							if assignedIP != "" {
+								s := &UserSession{Addr: rem, InternalIP: assignedIP, AEAD: aead, LastSeen: time.Now().Unix()}
+								nodeID := fmt.Sprintf("%x", sha256.Sum256([]byte(rem.String())))
+								mgr.ByIdentity.Store(nodeID, s)
+								mgr.ByAddr.Store(rem.String(), s)
+								mgr.ByIP.Store(assignedIP, s)
 
-						assignedIP := allocateIP()
-						if assignedIP != "" {
-							s := &UserSession{Addr: rem, InternalIP: assignedIP, AEAD: aead, LastSeen: time.Now().Unix()}
-							nodeID := fmt.Sprintf("%x", sha256.Sum256([]byte(rem.String())))
-							mgr.ByIdentity.Store(nodeID, s)
-							mgr.ByAddr.Store(rem.String(), s)
-							mgr.ByIP.Store(assignedIP, s)
+								go updateGeoInfo(rem.IP.String())
 
-							go updateGeoInfo(rem.IP.String())
-
-							// Inform client of assigned IP
-							conn.WriteToUDP(append([]byte{OP_KEM_REPLY}, []byte(assignedIP)...), rem)
-							pushLog("NODE_JOIN: " + assignedIP + " (PQC SECURED)")
+								// Inform client of assigned IP
+								conn.WriteToUDP(append([]byte{OP_KEM_REPLY}, []byte(assignedIP)...), rem)
+								pushLog("NODE_JOIN: " + assignedIP + " (PQC SECURED)")
+							}
 						}
 					} else if !*isServer {
 						// Client receives IP Assignment
