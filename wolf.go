@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -31,6 +32,7 @@ const (
 	TUN_MTU     = 1300
 	OVERHEAD    = 1 + 12 + 16
 	WINDOW_SIZE = 64
+	DNS         = "8.8.8.8"
 )
 
 const (
@@ -77,25 +79,26 @@ type GeoData struct {
 }
 
 var (
-	startTime       = time.Now()
-	mgr             = &SessionManager{}
-	conn            *net.UDPConn
-	origForwarding  string
-	clientAEAD      atomic.Value
-	clientSeq       uint64
-	lastActivity    int64
-	totalBytes      uint64
-	historyMu       sync.RWMutex
-	trafficHistory  = make([]uint64, 60)
-	bufferPool      = sync.Pool{New: func() interface{} { return make([]byte, 2048) }}
-	banMap          sync.Map // IP string -> int64 (expiry timestamp)
-	geoCache        sync.Map // IP string -> GeoData
-	globalLockdown  uint32   // 0 = normal, 1 = drop all
-	sysLog          []string
-	logMu           sync.Mutex
-	serverDK        *xwing.DecapsulationKey // private key
-	myPubKey        []byte
-	ClientCurrentIP atomic.Value
+	startTime        = time.Now()
+	mgr              = &SessionManager{}
+	conn             *net.UDPConn
+	origForwarding   string
+	clientAEAD       atomic.Value
+	clientSeq        uint64
+	lastActivity     int64
+	totalBytes       uint64
+	historyMu        sync.RWMutex
+	trafficHistory   = make([]uint64, 60)
+	bufferPool       = sync.Pool{New: func() interface{} { return make([]byte, 2048) }}
+	banMap           sync.Map // IP string -> int64 (expiry timestamp)
+	geoCache         sync.Map // IP string -> GeoData
+	globalLockdown   uint32   // 0 = normal, 1 = drop all
+	sysLog           []string
+	logMu            sync.Mutex
+	serverDK         *xwing.DecapsulationKey // private key
+	myPubKey         []byte
+	ClientCurrentIP  atomic.Value
+	ServerExternalIP atomic.Value
 )
 
 // --- Helpers ---
@@ -180,21 +183,34 @@ func allocateIP() string {
 	return ""
 }
 
-func setupNetworking(name string, peerStr string, isServer bool) {
+func updateServerIP() {
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://api.ipify.org")
+	if err != nil {
+		ServerExternalIP.Store("127.0.0.1")
+		return
+	}
+	defer resp.Body.Close()
+
+	ipBytes, _ := io.ReadAll(resp.Body)
+	ipStr := strings.TrimSpace(string(ipBytes))
+
+	ServerExternalIP.Store(ipStr)
+	// Also trigger a geo lookup so the server has coordinates in geoCache
+	go updateGeoInfo(ipStr)
+}
+
+func setupNetworking(name string, serverIP string, isServer bool) {
 	outFwd, _ := exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
 	origForwarding = strings.TrimSpace(string(outFwd))
 
 	// Find the physical interface and gateway
-	outRoute, _ := exec.Command("ip", "route", "show", "default").Output()
+	outRoute, _ := exec.Command("sh", "-c", "ip route show default | awk '/default/ {print $3, $5}'").Output()
 	fields := strings.Fields(string(outRoute))
-	var dev, gateway string
-	for i, f := range fields {
-		if f == "dev" {
-			dev = fields[i+1]
-		}
-		if f == "via" {
-			gateway = fields[i+1]
-		}
+	var gateway, dev string
+	if len(fields) >= 2 {
+		gateway = fields[0]
+		dev = fields[1]
 	}
 
 	runCmd("ip", "link", "set", "dev", name, "up", "mtu", fmt.Sprintf("%d", TUN_MTU))
@@ -208,18 +224,42 @@ func setupNetworking(name string, peerStr string, isServer bool) {
 			runCmd("iptables", "-A", "FORWARD", "-i", name, "-j", "ACCEPT")
 		}
 	} else {
-		fmt.Println("[SYS] Mode: CLIENT | Target:", peerStr)
-		// Extract server IP to prevent routing loops
-		serverIP := strings.Split(peerStr, ":")[0]
+		fmt.Printf("[SYS] Mode: CLIENT | Tunneling to IP: %s\n", serverIP)
+
 		if serverIP != "" && gateway != "" {
-			// Pin the server's IP to the physical gateway
+			fmt.Println("[SYS] Backing up /etc/resolv.conf to /tmp/resolv.conf.bak")
+			exec.Command("cp", "/etc/resolv.conf", "/etc/resolv.conf.bak").Run()
+			// 1. PIN EXISTING DNS SERVERS
+			// Read resolv.conf to find active resolvers BEFORE the tunnel hijacks them
+			dnsOut, _ := exec.Command("sh", "-c", "grep nameserver /etc/resolv.conf | awk '{print $2}'").Output()
+			dnsList := strings.Split(strings.TrimSpace(string(dnsOut)), "\n")
+
+			for _, dnsIP := range dnsList {
+				dnsIP = strings.TrimSpace(dnsIP)
+				// Skip local stub resolvers (127.0.0.53) which won't work outside the tunnel
+				if dnsIP != "" && !strings.HasPrefix(dnsIP, "127.") {
+					fmt.Printf("[SYS] Pinning system DNS %s via %s\n", dnsIP, gateway)
+					runCmd("ip", "route", "add", dnsIP, "via", gateway)
+				}
+			}
+
+			// 2. PIN GLOBAL FALLBACK & SERVER IP
+			// Pinning the serverIP (resolved from DDNS) is what keeps the tunnel alive
+			runCmd("ip", "route", "add", DNS, "via", gateway)
 			runCmd("ip", "route", "add", serverIP, "via", gateway)
+
+			// 3. FORCE DNS OVERRIDE
+			// Ensure all apps use the specific pinned path for DNS
+			runCmd("sh", "-c", "echo 'nameserver "+DNS+"' > /etc/resolv.conf")
 		}
 	}
 }
 
 func cleanup(isServer bool) {
 	fmt.Println("\n[SYS] Cleaning up...")
+	// RESTORE: Copy the backup back to /etc/resolv.conf
+	fmt.Println("[SYS] Restoring /etc/resolv.conf from backup")
+	exec.Command("mv", "/etc/resolv.conf.bak", "/etc/resolv.conf").Run()
 	if isServer {
 		runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-m", "comment", "--comment", "WOLFVPN", "-j", "MASQUERADE")
 	}
@@ -243,14 +283,23 @@ func main() {
 	}
 
 	var currentTarget *net.UDPAddr
+	var resolvedIP string
+
 	if *tAddrStr != "" {
 		if !strings.Contains(*tAddrStr, ":") {
 			*tAddrStr += ":9000"
 		}
-		currentTarget, _ = net.ResolveUDPAddr("udp", *tAddrStr)
+		// CRITICAL: Resolve the DDNS hostname to an IP BEFORE we touch the network
+		var err error
+		currentTarget, err = net.ResolveUDPAddr("udp", *tAddrStr)
+		if err != nil {
+			fmt.Printf("[FATAL] Could not resolve DDNS: %v\n", err)
+			os.Exit(1)
+		}
+		resolvedIP = currentTarget.IP.String()
 	}
 
-	setupNetworking(tun.Name(), *tAddrStr, *isServer)
+	setupNetworking(tun.Name(), resolvedIP, *isServer)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -265,7 +314,8 @@ func main() {
 
 	// --- 1. Stats & Web UI (Server Only) ---
 	if *isServer {
-		const bufferSize = 128 * 1024 * 1024 // 128MB
+		updateServerIP()
+		const bufferSize = 32 * 1024 * 1024 // 32MB
 		conn.SetReadBuffer(bufferSize)
 		conn.SetWriteBuffer(bufferSize)
 
@@ -428,13 +478,37 @@ func main() {
 							}
 						}
 					} else if !*isServer {
-						// Client receives IP Assignment/Confirmation
 						assignedIP := string(buf[1:n])
 
 						if ClientCurrentIP.Load() == nil {
-							// Only add routes if this is the very first assignment
+							// --- CRITICAL: FIX DNS BEFORE ENABLING TUNNEL ---
+
+							// 1. Find what we are using right now
+							dnsOut, _ := exec.Command("sh", "-c", "grep '^nameserver' /etc/resolv.conf | awk '{print $2}'").Output()
+							dnsList := strings.Split(strings.TrimSpace(string(dnsOut)), "\n")
+
+							// 2. Get the gateway again to be sure
+							outRoute, _ := exec.Command("sh", "-c", "ip route show default | awk '/default/ {print $3}'").Output()
+							gw := strings.TrimSpace(string(outRoute))
+
+							if gw != "" {
+								for _, dnsIP := range dnsList {
+									dnsIP = strings.TrimSpace(dnsIP)
+									if dnsIP != "" && !strings.HasPrefix(dnsIP, "127.") {
+										// Pin current DNS servers to the physical gateway
+										exec.Command("ip", "route", "add", dnsIP, "via", gw).Run()
+									}
+								}
+								// Also pin our fallback DNS
+								exec.Command("ip", "route", "add", DNS, "via", gw).Run()
+							}
+
+							// 3. NOW it is safe to hijack the routing table
 							runCmd("ip", "route", "add", "0.0.0.0/1", "dev", tun.Name())
 							runCmd("ip", "route", "add", "128.0.0.0/1", "dev", tun.Name())
+
+							// 4. Force the system to use our pinned DNS
+							runCmd("sh", "-c", "echo 'nameserver "+DNS+"' > /etc/resolv.conf")
 						}
 
 						if assignedIP != ClientCurrentIP.Load() {
@@ -443,7 +517,6 @@ func main() {
 						}
 
 						ClientCurrentIP.Store(assignedIP)
-						// Always update activity so the handshake trigger doesn't fire again immediately
 						atomic.StoreInt64(&lastActivity, time.Now().Unix())
 					}
 				}
@@ -575,6 +648,15 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		return true
 	})
 
+	// Fetch server's own geo data from the cache using the stored IP
+	srvIP, _ := ServerExternalIP.Load().(string)
+	srvLat, srvLon := 0.0, 0.0
+	if geo, ok := geoCache.Load(srvIP); ok {
+		if g, ok := geo.(GeoData); ok {
+			srvLat, srvLon = g.Lat, g.Lon
+		}
+	}
+
 	historyMu.RLock()
 	histCopy := make([]uint64, len(trafficHistory))
 	copy(histCopy, trafficHistory)
@@ -582,12 +664,15 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total":    formatBytes(atomic.LoadUint64(&totalBytes)),
-		"count":    len(peers),
-		"peers":    peers,
-		"hist":     histCopy,
-		"up":       time.Since(startTime).Truncate(time.Second).String(),
-		"lockdown": atomic.LoadUint32(&globalLockdown),
+		"server":    ServerExternalIP.Load(),
+		"serverLat": srvLat,
+		"serverLon": srvLon,
+		"total":     formatBytes(atomic.LoadUint64(&totalBytes)),
+		"count":     len(peers),
+		"peers":     peers,
+		"hist":      histCopy,
+		"up":        time.Since(startTime).Truncate(time.Second).String(),
+		"lockdown":  atomic.LoadUint32(&globalLockdown),
 	})
 }
 
@@ -669,7 +754,7 @@ func updateGeoInfo(ip string) {
 
 	// Don't lookup local addresses
 	if ip == "127.0.0.1" || strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") {
-		geoCache.Store(ip, GeoData{City: "Internal", Country: "LAN", Flag: "🏠", Lat: 0, Lon: 0})
+		geoCache.Store(ip, GeoData{City: "Internal", Country: "LAN", Flag: "🏠", Lat: 0.0, Lon: 0.0})
 		return
 	}
 
@@ -746,6 +831,8 @@ const dashboardHTML = `
             pointer-events: all; 
         }
 
+        .server-dot { fill: var(--cyan) !important; filter: drop-shadow(0 0 8px var(--cyan)); }
+
         #node-tooltip {
             position: absolute;
             display: none;
@@ -759,18 +846,18 @@ const dashboardHTML = `
             box-shadow: 0 0 15px rgba(255, 0, 85, 0.4);
         }
 
-        .ui-visible { opacity: 1; transition: opacity 0.5s ease; }
+        .ui-visible { opacity: 1; transition: opacity 0.5s ease; visibility: visible; }
         .ui-hidden { opacity: 0; visibility: hidden; pointer-events: none; }
 
         .panel { background: rgba(10, 15, 28, 0.9); backdrop-filter: blur(10px); border: 1px solid rgba(0, 242, 255, 0.1); }
         .glow { text-shadow: 0 0 10px var(--cyan); color: white; font-family: 'Orbitron'; }
-        .lockdown-ui { border-color: var(--pink) !important; background: rgba(30, 0, 0, 0.9) !important; }
         
         .btn { font-size: 10px; padding: 5px 15px; border: 1px solid var(--cyan); color: var(--cyan); cursor: pointer; text-transform: uppercase; clip-path: polygon(10% 0, 100% 0, 100% 70%, 90% 100%, 0 100%, 0 30%); transition: all 0.2s; }
         .btn:hover { background: var(--cyan); color: #000; box-shadow: 0 0 15px var(--cyan); }
         .btn-red { border-color: var(--pink); color: var(--pink); }
         
         #hud-toggle { position: fixed; bottom: 20px; right: 20px; z-index: 100; opacity: 0.5; }
+        .modal-content { background: rgba(10, 15, 28, 0.95); border: 1px solid var(--cyan); }
     </style>
 </head>
 <body>
@@ -799,6 +886,7 @@ const dashboardHTML = `
                 <div class="flex gap-4 mt-1 text-[9px]">
                     <span class="text-cyan-400">UPTIME: <span id="stat-up">--</span></span>
                     <span class="text-slate-500">TRAFFIC: <span id="stat-total">--</span></span>
+                    <span class="text-slate-500">SERVER: <span id="stat-srv-ip">--</span></span>
                 </div>
             </div>
             <div class="flex gap-3">
@@ -848,6 +936,27 @@ const dashboardHTML = `
                 .attr("fill", "#050a14").attr("stroke", "#00f2ff").attr("stroke-width", "0.5").attr("opacity", "0.4");
         });
 
+        function createFlowLine(start, end) {
+            const startPos = projection(start);
+            const endPos = projection(end);
+            const mid = [(startPos[0] + endPos[0]) / 2, (startPos[1] + endPos[1]) / 2 - 50];
+            const lineData = "M" + startPos[0] + "," + startPos[1] + " Q" + mid[0] + "," + mid[1] + " " + endPos[0] + "," + endPos[1];
+
+            const flowPath = mapGroup.append("path").attr("d", lineData).attr("fill", "none").attr("stroke", "rgba(0, 242, 255, 0.15)").attr("stroke-width", 1);
+            const particle = mapGroup.append("circle").attr("r", 1.5).attr("fill", "var(--cyan)");
+
+            particle.transition().duration(1500).ease(d3.easeLinear)
+                .attrTween("transform", function() {
+                    const l = flowPath.node().getTotalLength();
+                    return function(t) {
+                        const p = flowPath.node().getPointAtLength(t * l);
+                        return "translate(" + p.x + "," + p.y + ")";
+                    };
+                })
+                .on("end", () => { particle.remove(); flowPath.remove(); });
+        }
+
+        // RESTORED: Toggle UI and Keyboard Listener
         let uiHidden = false;
         function toggleUI() {
             uiHidden = !uiHidden;
@@ -868,41 +977,43 @@ const dashboardHTML = `
                 document.getElementById("stat-total").innerText = d.total;
                 document.getElementById("stat-count").innerText = d.count + " NODES";
                 document.getElementById("stat-up").innerText = d.up;
+                document.getElementById("stat-srv-ip").innerText = d.server || "---";
 
                 const tbody = document.getElementById("peer-list");
                 tbody.innerHTML = "";
+                const srvPos = [d.serverLon, d.serverLat];
+
+                mapGroup.selectAll(".server-dot").remove();
+                if (d.serverLat !== 0) {
+                    mapGroup.append("circle").attr("class", "server-dot").attr("r", 5).attr("cx", projection(srvPos)[0]).attr("cy", projection(srvPos)[1]);
+                }
+
                 (d.peers || []).forEach(p => {
                     const row = document.createElement("tr");
                     row.className = "border-b border-white/5 hover:bg-white/5";
                     row.innerHTML = '<td class="p-4"><div class="text-white font-bold">' + p.display_id + '</div><div class="text-[9px] text-cyan-600">' + p.ip + '</div></td>' +
-                        '<td class="p-4"><span class="text-lg">' + (p.flag || '🌐') + '</span> <span class="ml-2 text-slate-300">' + (p.city || 'Unknown') + '</span></td>' +
+                        '<td class="p-4"><span class="text-lg">' + (p.flag || '倹') + '</span> <span class="ml-2 text-slate-300">' + (p.city || 'Unknown') + '</span></td>' +
                         '<td class="p-4"><span class="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 text-[8px]">' + p.status + '</span></td>' +
                         '<td class="p-4 text-right flex gap-2 justify-end">' + 
                             '<button onclick="adminAction(\'kick\',\''+p.id+'\')" class="btn">Kick</button>' +
                             '<button onclick="adminAction(\'ban\',\''+p.ext_ip+'\')" class="btn btn-red">Ban</button>' +
                         '</td>';
                     tbody.appendChild(row);
+
+                    if (p.lat !== 0 && d.serverLat !== 0 && (p.rx !== "0 B" || p.tx !== "0 B")) {
+                        if (Math.random() > 0.5) createFlowLine([p.lon, p.lat], srvPos);
+                    }
                 });
 
                 const dots = mapGroup.selectAll(".dot").data(d.peers, p => p.id);
                 dots.exit().remove();
-                
-                dots.enter().append("circle")
-                    .attr("class", "dot")
-                    .attr("r", 4)
-                    .merge(dots)
-                    .attr("cx", p => projection([p.lon, p.lat])[0])
-                    .attr("cy", p => projection([p.lon, p.lat])[1])
+                dots.enter().append("circle").attr("class", "dot").attr("r", 4).merge(dots)
+                    .attr("cx", p => projection([p.lon, p.lat])[0]).attr("cy", p => projection([p.lon, p.lat])[1])
                     .on("mouseover", (e, p) => {
-                        tooltip.style("display", "block").html(
-                            '<div style="color:var(--pink);font-weight:bold">NODE: ' + p.display_id + '</div>' +
-                            '<div style="font-size:9px;opacity:0.8">' + p.city + ' (' + p.ext_ip + ')</div>' +
-                            '<div style="margin-top:4px;font-size:8px;color:#64748b">[CLICK TO BAN]</div>'
-                        );
+                        tooltip.style("display", "block").html('<div style="color:var(--pink);font-weight:bold">NODE: ' + p.display_id + '</div><div style="font-size:9px;opacity:0.8">' + p.city + ' (' + p.ext_ip + ')</div>');
                     })
                     .on("mousemove", e => tooltip.style("left", (e.pageX+15)+"px").style("top", (e.pageY-15)+"px"))
-                    .on("mouseout", () => tooltip.style("display", "none"))
-                    .on("click", (e, p) => { if(confirm("BAN "+p.ext_ip+"?")) adminAction('ban', p.ext_ip); });
+                    .on("mouseout", () => tooltip.style("display", "none"));
 
                 if (d.hist) { chart.data.datasets[0].data = d.hist; chart.update('none'); }
             } catch (e) {}
@@ -917,13 +1028,19 @@ const dashboardHTML = `
             update();
         }
 
+        // RESTORED: Log Explorer Functions
         async function openLogExplorer() {
             document.getElementById('log-modal').classList.remove('hidden');
             const r = await fetch("/api/admin?action=get_logs");
             document.getElementById('log-content').value = await r.text();
         }
         function closeLogExplorer() { document.getElementById('log-modal').classList.add('hidden'); }
-        function copyLogs() { document.getElementById('log-content').select(); document.execCommand('copy'); }
+        function copyLogs() { 
+            const content = document.getElementById('log-content');
+            content.select();
+            document.execCommand('copy');
+            alert("Logs copied to clipboard.");
+        }
 
         const chart = new Chart(document.getElementById('trafficChart'), {
             type: 'line',
