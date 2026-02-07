@@ -66,9 +66,9 @@ sudo ./wolf -l 9000 -t <SERVER_PUBLIC_IP>:9000
 
     [x] Basic TUN interface management
 
-    [x] TCP handshake and packet forwarding
+    [x] UDP handshake and packet forwarding
 
-    [x] Support for UDP transport
+    [x] Support for TCP transport
 
     [x] End-to-end encryption
 
