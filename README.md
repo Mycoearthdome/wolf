@@ -74,20 +74,6 @@ sudo ./wolf -l 9000 -t <SERVER_PUBLIC_IP>:9000
 
     [x] Dynamic IP address assignment (DHCP-like)
 
-📌 Usage Example
-
-To launch a UDP tunnel:
-
-Terminal A (Server):
-```Bash
-sudo ./wolf -l 9000 -server
-```
-
-Terminal B (Client):
-```Bash
-sudo ./wolf -l 9000 -ip [external server ip]:9000
-```
-
 Explore the Dashboard:
 <img width="1893" height="911" alt="Wolf_SYSOP_1" src="https://github.com/user-attachments/assets/0b38d760-5419-4239-ae11-f139b66a351a" />
 
