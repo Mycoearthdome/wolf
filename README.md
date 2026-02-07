@@ -76,7 +76,7 @@ sudo ./wolf -l 9000 -t <SERVER_PUBLIC_IP>:9000
 
 📌 Usage Example
 
-To simulate a local tunnel for testing:
+To launch a UDP tunnel:
 
 Terminal A (Server):
 ```Bash
