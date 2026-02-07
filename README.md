@@ -16,7 +16,7 @@ A lightweight, secure VPN tunnel implementation written in pure Go. **Wolf VPN**
 - [x] **Lightweight:** Minimal memory footprint and binary size.
 - [x] **Dual Role:** Same binary acts as both Server and Client.
 - [x] **Cross-Platform:** Full support for Linux and macOS (TUN/TAP).
-- [x] **KillSwitch:** only available on Linux iptables firewalls.
+- [x] **FIPS 203:** Post-Quantum Tunneling.
 
 ---
 
@@ -26,7 +26,7 @@ A lightweight, secure VPN tunnel implementation written in pure Go. **Wolf VPN**
 
 | Requirement | Minimum Version | Note |
 | :--- | :--- | :--- |
-| **Go Compiler** | 1.18+ | Required for building from source |
+| **Go Compiler** | 1.25+ | Required for building from source |
 | **OS** | Linux / macOS | Requires TUN/TAP driver support |
 | **Privileges** | Root / Sudo | Needed to manage network interfaces |
 
